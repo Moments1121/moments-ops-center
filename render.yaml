@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: moments-ops-center
+    runtime: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      # Fill these in on Render's dashboard after deploying:
+      # - key: TABLEAU_SERVER
+      # - key: TABLEAU_SITE_ID
+      # - key: TABLEAU_TOKEN_NAME
+      # - key: TABLEAU_TOKEN_VALUE
+      # - key: ZENDESK_SUBDOMAIN
+      # - key: ZENDESK_EMAIL
+      # - key: ZENDESK_API_TOKEN
+      # - key: MICROSOFT_TENANT_ID
+      # - key: MICROSOFT_CLIENT_ID
+      # - key: MICROSOFT_CLIENT_SECRET
+      # - key: MICROSOFT_MAILBOX
+      # - key: ANTHROPIC_API_KEY
+      # - key: REFRESH_INTERVAL_MINUTES
+      #   value: 30
+      # - key: SEND_EMAIL_DIGEST
+      #   value: true
+      # - key: DIGEST_TIME
+      #   value: "06:30"
+      # - key: DIGEST_RECIPIENTS
+      #   value: sol@momentshospice.com

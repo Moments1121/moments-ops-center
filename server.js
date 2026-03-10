@@ -97,17 +97,50 @@ async function getTableauViewData(viewId) {
 
 function parseCSV(csv) {
   if (!csv) return [];
-  const lines = csv.trim().split('\n');
+
+  // Proper RFC-4180 CSV parser - handles quoted fields with commas (e.g., patient names)
+  function parseLine(line) {
+    const fields = [];
+    let field = '';
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (inQuotes) {
+        if (ch === '"' && line[i + 1] === '"') { field += '"'; i++; }
+        else if (ch === '"') { inQuotes = false; }
+        else { field += ch; }
+      } else {
+        if (ch === '"') { inQuotes = true; }
+        else if (ch === ',') { fields.push(field.trim()); field = ''; }
+        else { field += ch; }
+      }
+    }
+    fields.push(field.trim());
+    return fields;
+  }
+
+  // Split lines respecting quoted newlines
+  const lines = [];
+  let current = '';
+  let inQ = false;
+  for (const ch of csv.replace(/\r/g, '')) {
+    if (ch === '"') { inQ = !inQ; current += ch; }
+    else if (ch === '\n' && !inQ) { lines.push(current); current = ''; }
+    else { current += ch; }
+  }
+  if (current) lines.push(current);
+
   if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-  return lines.slice(1).map(line => {
-    const values = line.match(/(".*?"|[^,]+)(?=,|$)/g) || [];
+  const headers = parseLine(lines[0]);
+  const rows = [];
+  for (const line of lines.slice(1)) {
+    if (!line.trim()) continue;
+    const values = parseLine(line);
     const obj = {};
-    headers.forEach((h, i) => {
-      obj[h] = (values[i] || '').replace(/"/g, '').trim();
-    });
-    return obj;
-  });
+    headers.forEach((h, i) => { obj[h] = (values[i] || '').trim(); });
+    rows.push(obj);
+  }
+  return rows;
 }
 
 // Tableau View IDs — confirmed working March 10 2026
@@ -209,54 +242,52 @@ async function fetchZendeskData() {
   }
   console.log('📞 Fetching Zendesk data...');
 
-  const base = `https://${process.env.ZENDESK_SUBDOMAIN.replace(/^https?:\/\//, '').replace('.zendesk.com', '')}.zendesk.com/api/v2`;
+  const subdomain = process.env.ZENDESK_SUBDOMAIN.replace(/^https?:\/\//, '').replace('.zendesk.com', '');
+  const base = `https://${subdomain}.zendesk.com/api/v2`;
   const auth = Buffer.from(`${process.env.ZENDESK_EMAIL}/token:${process.env.ZENDESK_API_TOKEN}`).toString('base64');
   const headers = { Authorization: `Basic ${auth}` };
 
   try {
-    // Open tickets
-    const [openRes, overdueRes, recentRes] = await Promise.all([
-      axios.get(`${base}/tickets?status=open&per_page=100`, { headers }),
-      axios.get(`${base}/tickets?status=open&sort_by=created_at&sort_order=asc&per_page=50`, { headers }),
-      axios.get(`${base}/tickets?status=open&per_page=100&sort_by=updated_at&sort_order=desc`, { headers }),
+    // ── 1. Get REAL total counts via count endpoints (not capped at 100) ──────
+    const now = Date.now();
+    const cutoff48h  = new Date(now - 48 * 3600000).toISOString();
+    const cutoff72h  = new Date(now - 72 * 3600000).toISOString();
+    const cutoff7d   = new Date(now - 7 * 24 * 3600000).toISOString();
+
+    const [countRes, overdueCountRes, bouncingCountRes, escalatedCountRes, solvedRes] = await Promise.all([
+      // Total open ticket count
+      axios.get(`${base}/tickets/count?status=open`, { headers }),
+      // Overdue: open tickets created before 48h ago
+      axios.get(`${base}/search/count?query=type:ticket status:open created<${cutoff48h}`, { headers }),
+      // Bouncing: open tickets created before 72h ago
+      axios.get(`${base}/search/count?query=type:ticket status:open created<${cutoff72h}`, { headers }),
+      // Escalated: urgent or high priority open tickets
+      axios.get(`${base}/search/count?query=type:ticket status:open priority:urgent`, { headers }),
+      // Recent solved for avg response time
+      axios.get(`${base}/tickets?status=solved&per_page=50&sort_by=updated_at&sort_order=desc`, { headers }),
     ]);
 
+    const totalOpenCount   = countRes.data.count?.value || 0;
+    const overdueCount     = overdueCountRes.data.count || 0;
+    const bouncingCount    = bouncingCountRes.data.count || 0;
+    const escalatedCount   = escalatedCountRes.data.count || 0;
+
+    // ── 2. Fetch a page of open tickets for qualitative analysis ─────────────
+    const openRes = await axios.get(`${base}/tickets?status=open&per_page=100&sort_by=created_at&sort_order=asc`, { headers });
     const openTickets = openRes.data.tickets || [];
-    const now = Date.now();
 
-    // Analyze tickets
-    const overdueTickets = openTickets.filter(t => {
-      const createdAt = new Date(t.created_at).getTime();
-      const hoursOpen = (now - createdAt) / (1000 * 60 * 60);
-      return hoursOpen > 48;
-    });
-
-    const escalatedTickets = openTickets.filter(t =>
-      t.priority === 'urgent' || t.priority === 'high' || t.tags?.includes('escalated')
-    );
-
-    // Find frustrated tickets by scanning descriptions
-    const frustratedTickets = openTickets.filter(t => {
-      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
-      return FRUSTRATION_KEYWORDS.some(kw => text.includes(kw));
-    });
-
-    const clinicalTickets = openTickets.filter(t => {
-      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
-      return CLINICAL_KEYWORDS.some(kw => text.includes(kw));
-    });
-
-    // Category breakdown
+    // Categorize the sample we have
     const categoryMap = {};
     openTickets.forEach(t => {
       const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
       let category = 'General';
-      if (text.includes('medication') || text.includes('pain') || text.includes('pharmacy')) category = 'Medication / Pain';
-      else if (text.includes('visit') || text.includes('nurse') || text.includes('aide')) category = 'Visit Issue';
+      if (text.includes('medication') || text.includes('pain') || text.includes('pharmacy'))  category = 'Medication / Pain';
       else if (text.includes('fall') || text.includes('emergency') || text.includes('safety')) category = 'Safety / Fall';
-      else if (text.includes('equipment') || text.includes('supply')) category = 'Equipment / Supply';
-      else if (text.includes('complaint') || text.includes('family')) category = 'Family Complaint';
-      else if (text.includes('billing') || text.includes('invoice')) category = 'Billing';
+      else if (text.includes('visit') || text.includes('nurse') || text.includes('aide'))      category = 'Visit Issue';
+      else if (text.includes('equipment') || text.includes('supply') || text.includes('dme'))  category = 'Equipment / DME';
+      else if (text.includes('complaint') || text.includes('family'))                          category = 'Family Complaint';
+      else if (text.includes('billing') || text.includes('invoice') || text.includes('order')) category = 'Billing / Orders';
+      else if (text.includes('referral') || text.includes('consult') || text.includes('admit')) category = 'Referral / Admission';
 
       if (!categoryMap[category]) categoryMap[category] = [];
       categoryMap[category].push(t);
@@ -273,37 +304,37 @@ async function fetchZendeskData() {
       .sort((a, b) => b.count - a.count)
       .slice(0, 8);
 
-    // Average response time
-    const solvedRes = await axios.get(`${base}/tickets?status=solved&per_page=50&sort_by=updated_at&sort_order=desc`, { headers });
+    // Clinical / safety tickets from sample
+    const clinicalTickets = openTickets.filter(t => {
+      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
+      return CLINICAL_KEYWORDS.some(kw => text.includes(kw));
+    });
+
+    // Avg response from recent solved
     const solvedTickets = solvedRes.data.tickets || [];
     const avgResponseHours = solvedTickets.length > 0
       ? Math.round(
-          solvedTickets.reduce((sum, t) => {
-            return sum + (new Date(t.updated_at).getTime() - new Date(t.created_at).getTime()) / (1000 * 60 * 60);
-          }, 0) / solvedTickets.length
-        )
+          solvedTickets.reduce((sum, t) =>
+            sum + (new Date(t.updated_at).getTime() - new Date(t.created_at).getTime()) / (1000 * 60 * 60), 0)
+          / solvedTickets.length)
       : 0;
-
-    // Tickets bouncing back and forth (updated many times but still open)
-    const bouncingTickets = openTickets.filter(t => {
-      const hoursOpen = (now - new Date(t.created_at).getTime()) / (1000 * 60 * 60);
-      return hoursOpen > 72; // Open more than 3 days = bouncing
-    });
 
     return {
       available: true,
-      openCount: openTickets.length,
-      overdueCount: overdueTickets.length,
-      escalatedCount: escalatedTickets.length,
-      frustratedCount: frustratedTickets.length,
+      openCount: totalOpenCount,   // ← real total, not capped at 100
+      overdueCount,                // ← real count via search API
+      escalatedCount,              // ← real count via search API
+      bouncingCount,               // ← real count via search API
       clinicalCount: clinicalTickets.length,
-      bouncingCount: bouncingTickets.length,
+      frustratedCount: openTickets.filter(t =>
+        FRUSTRATION_KEYWORDS.some(kw => ((t.subject||'')+(t.description||'')).toLowerCase().includes(kw))
+      ).length,
       avgResponseHours,
       topIssues,
       detectedKeywords: FRUSTRATION_KEYWORDS.filter(kw =>
         openTickets.some(t => ((t.subject || '') + (t.description || '')).toLowerCase().includes(kw))
       ),
-      criticalTickets: clinicalTickets.slice(0, 5).map(t => ({
+      criticalTickets: clinicalTickets.slice(0, 8).map(t => ({
         id: t.id,
         subject: t.subject,
         hoursOpen: Math.round((now - new Date(t.created_at).getTime()) / (1000 * 60 * 60)),

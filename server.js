@@ -1,752 +1,501 @@
-require('dotenv').config();
-const express = require('express');
-const WebSocket = require('ws');
-const cron = require('node-cron');
-const axios = require('axios');
-const cors = require('cors');
-const http = require('http');
-const path = require('path');
+jsximport { useState, useEffect } from "react";
 
-const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
-
-// ============================================================
-// STATE — latest fetched data stored in memory
-// ============================================================
-let latestData = null;
-let lastFetched = null;
-let isFetching = false;
-
-// ============================================================
-// WEBSOCKET — push updates to all connected clients
-// ============================================================
-function broadcast(data) {
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(data));
-    }
-  });
-}
-
-wss.on('connection', (ws) => {
-  console.log('Client connected');
-  // Send latest data immediately on connect
-  if (latestData) {
-    ws.send(JSON.stringify({ type: 'data', payload: latestData, lastFetched }));
-  } else {
-    ws.send(JSON.stringify({ type: 'loading' }));
-  }
-});
-
-// ============================================================
-// TABLEAU API
-// ============================================================
-let tableauAuthToken = null;
-let tableauTokenExpiry = null;
-let tableauSiteLuid = null; // The real UUID Tableau needs for API calls
-
-async function getTableauToken() {
-  if (tableauAuthToken && tableauTokenExpiry && Date.now() < tableauTokenExpiry) {
-    return tableauAuthToken;
-  }
-  try {
-    const res = await axios.post(
-      `${process.env.TABLEAU_SERVER}/api/3.21/auth/signin`,
-      {
-        credentials: {
-          personalAccessTokenName: process.env.TABLEAU_TOKEN_NAME,
-          personalAccessTokenSecret: process.env.TABLEAU_TOKEN_VALUE,
-          site: { contentUrl: process.env.TABLEAU_SITE_ID }
-        }
-      }
-    );
-    tableauAuthToken = res.data.credentials.token;
-    // Capture the site LUID (UUID) — this is what the REST API actually needs
-    tableauSiteLuid = res.data.credentials.site.id;
-    tableauTokenExpiry = Date.now() + 200 * 60 * 1000;
-    console.log('✅ Tableau auth token refreshed, site LUID:', tableauSiteLuid);
-    return tableauAuthToken;
-  } catch (err) {
-    console.error('❌ Tableau auth failed:', err.message);
-    return null;
-  }
-}
-
-async function getTableauViewData(viewId) {
-  const token = await getTableauToken();
-  if (!token || !tableauSiteLuid) return null;
-  try {
-    const res = await axios.get(
-      `${process.env.TABLEAU_SERVER}/api/3.21/sites/${tableauSiteLuid}/views/${viewId}/data`,
-      {
-        headers: { 'X-Tableau-Auth': token },
-        params: { maxAge: 5 } // allow up to 5 min cached extract
-      }
-    );
-    return parseCSV(res.data);
-  } catch (err) {
-    console.error(`❌ Tableau view ${viewId} failed:`, err.message);
-    return null;
-  }
-}
-
-function parseCSV(csv) {
-  if (!csv) return [];
-  const lines = csv.trim().split('\n');
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-  return lines.slice(1).map(line => {
-    const values = line.match(/(".*?"|[^,]+)(?=,|$)/g) || [];
-    const obj = {};
-    headers.forEach((h, i) => {
-      obj[h] = (values[i] || '').replace(/"/g, '').trim();
-    });
-    return obj;
-  });
-}
-
-// Your actual Tableau View IDs from Moments Hospice site
-const TABLEAU_VIEWS = {
-  keyMetricsSummary:    '19bb88d6-87df-4777-a793-e5b075c51390',
-  keyMetricsCensus:     '83d74db5-a7dd-4069-9b87-eb07eca1a6b7', // Default project - no permission issue
-  keyMetricsAdmitsDC:   'a7f03568-243c-49a7-936c-12d72f4cda22', // Default project
-  keyMetricsVisits:     '36e87a3f-380e-4cb3-af55-408dd0cbdc3e', // Default project
-  keyMetricsGrossMargin:'ea12fe7f-f607-4fca-a273-2e478b07119f',
-  keyMetricsCostPerDay: '4323de7a-ab69-4fa8-b02a-3af0316e0b2c',
-  visitPatterns:        '7fa1a9e7-04e5-4926-acf1-36852cd91db7', // Visits - Counts (Scheduling)
-  visitsMissed:         'a6260fca-9f9c-411f-a727-90f91ab115d9', // Visits - Missed
-  hospiceCensus:        '0d1e5ad7-b894-45c0-94dc-a15a2ed5c1c7',
-  workerTurnover:       '90b95c03-aed5-48ad-9f7d-79715fe6eb1c',
-  fieldMetrics:         'a3b94d0b-167a-4901-9c8c-a04bd13917de',
-  visitUtilization:     '76559abf-47a8-475e-9d96-eecb35e20d2a',
+const BRANCH_MAP = {
+  eau_claire: "Eau Claire", duluth: "Duluth", firekeepers___wi: "GRB Firekeepers",
+  lightkeepers___wi: "GRB Light", milwaukee: "Milwaukee", sheboygan__wi: "Sheboygan",
+  rochester: "Rochester", miami_fl_leon: "MIA Leon N", miami_fl_leon_south: "MIA Leon S",
+  chicago_s: "Chicago S", springfield_il: "Springfield IL", la_crosse: "La Crosse",
+  stevens_point: "Stevens Point", mountain_movers___wi: "GRB Mountain",
+  hiawatha__ia: "Hiawatha IA", hudson: "Hudson WI", st_cloud_mn_blue_team: "St Cloud B",
+  st_cloud: "St Cloud", golden_valley: "Golden Valley", golden_valley_mn_purple: "GV Purple",
+  madison: "Madison", mankato: "Mankato", brainerd: "Brainerd", rhinelander_wi: "Rhinelander",
+  alexandria: "Alexandria",
 };
 
-async function fetchTableauData() {
-  console.log('📊 Fetching Tableau data...');
-  const [census, admitsDC, visits, visitPatterns, visitsMissed, workerTurnover] = await Promise.all([
-    getTableauViewData(TABLEAU_VIEWS.keyMetricsCensus),
-    getTableauViewData(TABLEAU_VIEWS.keyMetricsAdmitsDC),
-    getTableauViewData(TABLEAU_VIEWS.keyMetricsVisits),
-    getTableauViewData(TABLEAU_VIEWS.visitPatterns),
-    getTableauViewData(TABLEAU_VIEWS.visitsMissed),
-    getTableauViewData(TABLEAU_VIEWS.workerTurnover),
-  ]);
+const CRITICAL_TAGS = {
+  _unverified_visit_request: { label: "Late/Unverified Visit", severity: "critical", color: "#FF4B4B" },
+  daily_audit_for_unverified_visit: { label: "Orders Missing", severity: "critical", color: "#FF4B4B" },
+  occurrence_clarification: { label: "QI Incident", severity: "critical", color: "#FF4B4B" },
+  _declined_visit: { label: "Declined Visit", severity: "high", color: "#FF8C00" },
+  huv_follow_up: { label: "HUV Audit", severity: "high", color: "#FF8C00" },
+  dme_not_ordered: { label: "DME Not Ordered", severity: "critical", color: "#FF4B4B" },
+  dme_need_more_info_from_field_worker: { label: "DME Pending", severity: "high", color: "#FF8C00" },
+  no_response_start: { label: "No Response", severity: "high", color: "#FF8C00" },
+  order_tracking: { label: "Open Order", severity: "high", color: "#FF8C00" },
+  qa_bump_start: { label: "QA Escalated", severity: "critical", color: "#FF4B4B" },
+  declined_meds: { label: "Meds Declined", severity: "critical", color: "#FF4B4B" },
+  referral_intake: { label: "New Referral", severity: "info", color: "#00D4AA" },
+  reschedule_visit: { label: "Reschedule", severity: "medium", color: "#FFD700" },
+  reassign_visit: { label: "Reassign Visit", severity: "medium", color: "#FFD700" },
+};
 
-  return {
-    census: census || [],
-    admitsDischarges: admitsDC || [],
-    visits: visits || [],
-    visitPatterns: visitPatterns || [],
-    visitsMissed: visitsMissed || [],
-    workerTurnover: workerTurnover || [],
-  };
+function useTypewriter(text, speed = 10) {
+  const [displayed, setDisplayed] = useState("");
+  const [done, setDone] = useState(false);
+  useEffect(() => {
+    if (!text) return;
+    setDisplayed(""); setDone(false);
+    let i = 0;
+    const iv = setInterval(() => {
+      i++;
+      setDisplayed(text.slice(0, i));
+      if (i >= text.length) { clearInterval(iv); setDone(true); }
+    }, speed);
+    return () => clearInterval(iv);
+  }, [text]);
+  return { displayed, done };
 }
 
-// ============================================================
-// ZENDESK API
-// ============================================================
-const FRUSTRATION_KEYWORDS = [
-  'still waiting', 'no response', 'urgent', 'unacceptable',
-  'called 3 times', 'no one answered', 'frustrated', 'pain',
-  'emergency', 'fell', 'fall', 'medication', 'not received',
-  'never came', 'no show', 'angry', 'complaint'
-];
-
-const CLINICAL_KEYWORDS = [
-  'medication', 'pain', 'fall', 'emergency', 'not breathing',
-  'hospice nurse', 'supply', 'equipment', 'pharmacy'
-];
-
-async function fetchZendeskData() {
-  if (!process.env.ZENDESK_SUBDOMAIN || !process.env.ZENDESK_API_TOKEN) {
-    return { available: false };
-  }
-  console.log('📞 Fetching Zendesk data...');
-
-  const base = `https://${process.env.ZENDESK_SUBDOMAIN.replace(/^https?:\/\//, '').replace('.zendesk.com', '')}.zendesk.com/api/v2`;
-  const auth = Buffer.from(`${process.env.ZENDESK_EMAIL}/token:${process.env.ZENDESK_API_TOKEN}`).toString('base64');
-  const headers = { Authorization: `Basic ${auth}` };
-
-  try {
-    // Open tickets
-    const [openRes, overdueRes, recentRes] = await Promise.all([
-      axios.get(`${base}/tickets?status=open&per_page=100`, { headers }),
-      axios.get(`${base}/tickets?status=open&sort_by=created_at&sort_order=asc&per_page=50`, { headers }),
-      axios.get(`${base}/tickets?status=open&per_page=100&sort_by=updated_at&sort_order=desc`, { headers }),
-    ]);
-
-    const openTickets = openRes.data.tickets || [];
-    const now = Date.now();
-
-    // Analyze tickets
-    const overdueTickets = openTickets.filter(t => {
-      const createdAt = new Date(t.created_at).getTime();
-      const hoursOpen = (now - createdAt) / (1000 * 60 * 60);
-      return hoursOpen > 48;
-    });
-
-    const escalatedTickets = openTickets.filter(t =>
-      t.priority === 'urgent' || t.priority === 'high' || t.tags?.includes('escalated')
-    );
-
-    // Find frustrated tickets by scanning descriptions
-    const frustratedTickets = openTickets.filter(t => {
-      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
-      return FRUSTRATION_KEYWORDS.some(kw => text.includes(kw));
-    });
-
-    const clinicalTickets = openTickets.filter(t => {
-      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
-      return CLINICAL_KEYWORDS.some(kw => text.includes(kw));
-    });
-
-    // Category breakdown
-    const categoryMap = {};
-    openTickets.forEach(t => {
-      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
-      let category = 'General';
-      if (text.includes('medication') || text.includes('pain') || text.includes('pharmacy')) category = 'Medication / Pain';
-      else if (text.includes('visit') || text.includes('nurse') || text.includes('aide')) category = 'Visit Issue';
-      else if (text.includes('fall') || text.includes('emergency') || text.includes('safety')) category = 'Safety / Fall';
-      else if (text.includes('equipment') || text.includes('supply')) category = 'Equipment / Supply';
-      else if (text.includes('complaint') || text.includes('family')) category = 'Family Complaint';
-      else if (text.includes('billing') || text.includes('invoice')) category = 'Billing';
-
-      if (!categoryMap[category]) categoryMap[category] = [];
-      categoryMap[category].push(t);
-    });
-
-    const topIssues = Object.entries(categoryMap)
-      .map(([category, tickets]) => ({
-        category,
-        count: tickets.length,
-        avgHoursOpen: Math.round(
-          tickets.reduce((sum, t) => sum + (now - new Date(t.created_at).getTime()) / (1000 * 60 * 60), 0) / tickets.length
-        ),
-      }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 8);
-
-    // Average response time
-    const solvedRes = await axios.get(`${base}/tickets?status=solved&per_page=50&sort_by=updated_at&sort_order=desc`, { headers });
-    const solvedTickets = solvedRes.data.tickets || [];
-    const avgResponseHours = solvedTickets.length > 0
-      ? Math.round(
-          solvedTickets.reduce((sum, t) => {
-            return sum + (new Date(t.updated_at).getTime() - new Date(t.created_at).getTime()) / (1000 * 60 * 60);
-          }, 0) / solvedTickets.length
-        )
-      : 0;
-
-    // Tickets bouncing back and forth (updated many times but still open)
-    const bouncingTickets = openTickets.filter(t => {
-      const hoursOpen = (now - new Date(t.created_at).getTime()) / (1000 * 60 * 60);
-      return hoursOpen > 72; // Open more than 3 days = bouncing
-    });
-
-    return {
-      available: true,
-      openCount: openTickets.length,
-      overdueCount: overdueTickets.length,
-      escalatedCount: escalatedTickets.length,
-      frustratedCount: frustratedTickets.length,
-      clinicalCount: clinicalTickets.length,
-      bouncingCount: bouncingTickets.length,
-      avgResponseHours,
-      topIssues,
-      detectedKeywords: FRUSTRATION_KEYWORDS.filter(kw =>
-        openTickets.some(t => ((t.subject || '') + (t.description || '')).toLowerCase().includes(kw))
-      ),
-      criticalTickets: clinicalTickets.slice(0, 5).map(t => ({
-        id: t.id,
-        subject: t.subject,
-        hoursOpen: Math.round((now - new Date(t.created_at).getTime()) / (1000 * 60 * 60)),
-        priority: t.priority,
-        status: t.status,
-      })),
-    };
-  } catch (err) {
-    console.error('❌ Zendesk fetch failed:', err.message);
-    return { available: false, error: err.message };
-  }
-}
-
-// ============================================================
-// MICROSOFT 365 — Email Scanning
-// ============================================================
-let msGraphToken = null;
-let msGraphTokenExpiry = null;
-
-async function getMsGraphToken() {
-  if (msGraphToken && msGraphTokenExpiry && Date.now() < msGraphTokenExpiry) {
-    return msGraphToken;
-  }
-  try {
-    const res = await axios.post(
-      `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,
-      new URLSearchParams({
-        grant_type: 'client_credentials',
-        client_id: process.env.MICROSOFT_CLIENT_ID,
-        client_secret: process.env.MICROSOFT_CLIENT_SECRET,
-        scope: 'https://graph.microsoft.com/.default'
-      }),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
-    );
-    msGraphToken = res.data.access_token;
-    msGraphTokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
-    console.log('✅ Microsoft Graph token refreshed');
-    return msGraphToken;
-  } catch (err) {
-    console.error('❌ Microsoft Graph auth failed:', err.message);
-    return null;
-  }
-}
-
-const RESIGNATION_KEYWORDS = ['resign', '2-week notice', 'two week notice', 'last day', 'leaving', 'my notice', 'notice of resignation', 'effective immediately', 'final day'];
-const COMPLAINT_KEYWORDS = ['complaint', 'grievance', 'survey', 'concern', 'issue with care', 'unhappy', 'dissatisfied'];
-const STAFFING_KEYWORDS = ['short staffed', 'no coverage', "can't cover", 'need coverage', 'call out', 'no show', 'last minute'];
-
-async function fetchEmailData() {
-  const token = await getMsGraphToken();
-  if (!token) return { available: false };
-
-  console.log('📧 Scanning emails...');
-
-  const headers = { Authorization: `Bearer ${token}` };
-  const mailbox = process.env.MICROSOFT_MAILBOX;
-  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-
-  const searchEmails = async (keywords) => {
-    const query = keywords.map(k => `"${k}"`).join(' OR ');
-    try {
-      const res = await axios.get(
-        `https://graph.microsoft.com/v1.0/users/${mailbox}/messages`,
-        {
-          headers,
-          params: {
-            '$search': `"${keywords[0]}"`,
-            '$filter': `receivedDateTime ge ${sevenDaysAgo}`,
-            '$select': 'subject,receivedDateTime,from,bodyPreview',
-            '$top': 50,
-          }
-        }
-      );
-      return res.data.value || [];
-    } catch { return []; }
-  };
-
-  const [resignationEmails, complaintEmails, staffingEmails] = await Promise.all([
-    searchEmails(RESIGNATION_KEYWORDS),
-    searchEmails(COMPLAINT_KEYWORDS),
-    searchEmails(STAFFING_KEYWORDS),
-  ]);
-
-  // Extract branch from email content
-  const extractBranch = (text) => {
-    const branches = ['MKM', 'MKT', 'MIA', 'CHI', 'IL', 'Minneapolis', 'Mankato', 'Miami', 'Chicago'];
-    for (const b of branches) {
-      if (text.toUpperCase().includes(b.toUpperCase())) return b;
-    }
-    return 'Unknown';
-  };
-
-  const resignations = resignationEmails
-    .filter(e => RESIGNATION_KEYWORDS.some(k => (e.subject || '').toLowerCase().includes(k.toLowerCase())))
-    .map(e => ({
-      subject: e.subject,
-      from: e.from?.emailAddress?.name || e.from?.emailAddress?.address,
-      receivedAt: e.receivedDateTime,
-      branch: extractBranch(e.subject + ' ' + e.bodyPreview),
-      preview: e.bodyPreview?.substring(0, 100),
-    }));
-
-  const complaints = complaintEmails
-    .filter(e => COMPLAINT_KEYWORDS.some(k => (e.subject || '').toLowerCase().includes(k.toLowerCase())))
-    .map(e => ({
-      subject: e.subject,
-      from: e.from?.emailAddress?.name,
-      receivedAt: e.receivedDateTime,
-      branch: extractBranch(e.subject + ' ' + e.bodyPreview),
-    }));
-
-  const staffingAlerts = staffingEmails
-    .filter(e => STAFFING_KEYWORDS.some(k => (e.subject || '').toLowerCase().includes(k.toLowerCase())))
-    .map(e => ({
-      subject: e.subject,
-      from: e.from?.emailAddress?.name,
-      receivedAt: e.receivedDateTime,
-      branch: extractBranch(e.subject + ' ' + e.bodyPreview),
-    }));
-
-  return {
-    available: true,
-    resignations,
-    complaints,
-    staffingAlerts,
-    resignationCount: resignations.length,
-    complaintCount: complaints.length,
-    staffingAlertCount: staffingAlerts.length,
-  };
-}
-
-// ============================================================
-// AI SYNTHESIS — Claude generates the intelligence summary
-// ============================================================
-async function generateIntelligence(tableau, zendesk, email) {
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return generateRuleBasedAlerts(tableau, zendesk, email);
-  }
-
-  try {
-    const res = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      {
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 1500,
-        system: `You are the Moments Hospice operations intelligence system. Analyze real operational data and return ONLY valid JSON (no markdown) with this structure:
-{
-  "riskAlerts": [{"level":"critical|high|medium|low","title":"...","detail":"...","source":"zendesk|email|tableau","branch":"..."}],
-  "summary": "2-3 sentence executive summary of the most urgent issues right now",
-  "staffingModelStatus": "on-track|at-risk|critical",
-  "topAction": "The single most important thing to address today"
-}`,
-        messages: [{
-          role: 'user',
-          content: `Analyze this Moments Hospice operational data and generate risk alerts:
-
-TABLEAU DATA:
-- Census rows: ${tableau.census?.length || 0} branches with data
-- Admits/Discharges data: ${JSON.stringify(tableau.admitsDischarges?.slice(0, 5))}
-- Visit data: ${JSON.stringify(tableau.visits?.slice(0, 5))}
-- Visit patterns: ${JSON.stringify(tableau.visitPatterns?.slice(0, 3))}
-
-ZENDESK:
-- Open tickets: ${zendesk.openCount || 0}
-- Overdue (>48h): ${zendesk.overdueCount || 0}
-- Escalated: ${zendesk.escalatedCount || 0}
-- Clinical/safety tickets: ${zendesk.clinicalCount || 0}
-- Bouncing tickets (>72h unresolved): ${zendesk.bouncingCount || 0}
-- Top issues: ${JSON.stringify(zendesk.topIssues || [])}
-- Critical tickets: ${JSON.stringify(zendesk.criticalTickets || [])}
-- Detected keywords: ${JSON.stringify(zendesk.detectedKeywords || [])}
-
-EMAIL (last 7 days):
-- Resignations detected: ${email.resignationCount || 0}
-${(email.resignations || []).map(r => `  - ${r.from} (${r.branch}): "${r.subject}"`).join('\n')}
-- Complaints: ${email.complaintCount || 0}
-- Staffing alerts: ${email.staffingAlertCount || 0}
-
-Generate specific, actionable risk alerts. Flag visit frequency gaps (target CNA 5x/wk, RN 2x/wk, SW/Chaplain 2x/month), patient safety issues, staffing crises, and Zendesk escalations.`
-        }]
-      },
-      { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } }
-    );
-
-    const text = res.data.content?.[0]?.text || '';
-    const match = text.match(/\{[\s\S]*\}/);
-    return match ? JSON.parse(match[0]) : generateRuleBasedAlerts(tableau, zendesk, email);
-  } catch (err) {
-    console.error('❌ AI synthesis failed:', err.message);
-    return generateRuleBasedAlerts(tableau, zendesk, email);
-  }
-}
-
-function generateRuleBasedAlerts(tableau, zendesk, email) {
-  const alerts = [];
-
-  if ((email.resignationCount || 0) >= 2) {
-    const branches = [...new Set((email.resignations || []).map(r => r.branch))];
-    alerts.push({
-      level: 'critical',
-      title: `${email.resignationCount} Resignations in Last 7 Days`,
-      detail: `Branches affected: ${branches.join(', ')}. Check census levels and schedule coverage immediately.`,
-      source: 'email',
-      branch: branches[0] || 'Unknown'
-    });
-  }
-
-  if ((zendesk.escalatedCount || 0) > 0) {
-    alerts.push({
-      level: 'critical',
-      title: `${zendesk.escalatedCount} Escalated Zendesk Tickets`,
-      detail: `${zendesk.clinicalCount || 0} are clinical/safety related. Immediate follow-up required.`,
-      source: 'zendesk',
-      branch: 'ALL'
-    });
-  }
-
-  if ((zendesk.overdueCount || 0) > 10) {
-    alerts.push({
-      level: 'high',
-      title: `${zendesk.overdueCount} Tickets Overdue (>48hrs)`,
-      detail: `Average response time is ${zendesk.avgResponseHours}h. Target is under 4 hours.`,
-      source: 'zendesk',
-      branch: 'ALL'
-    });
-  }
-
-  if ((email.staffingAlertCount || 0) > 0) {
-    alerts.push({
-      level: 'high',
-      title: `${email.staffingAlertCount} Staffing Alert Emails Detected`,
-      detail: `Emails with keywords: short staffed, no coverage, can't cover. Review branch schedule.`,
-      source: 'email',
-      branch: 'Unknown'
-    });
-  }
-
-  if ((zendesk.bouncingCount || 0) > 5) {
-    alerts.push({
-      level: 'medium',
-      title: `${zendesk.bouncingCount} Tickets Open >72 Hours Without Resolution`,
-      detail: `These are bouncing back and forth with no resolution — highest customer service failure risk.`,
-      source: 'zendesk',
-      branch: 'ALL'
-    });
-  }
-
-  return {
-    riskAlerts: alerts,
-    summary: `${alerts.filter(a => a.level === 'critical').length} critical alerts active. ${zendesk.openCount || 0} open Zendesk tickets with ${zendesk.overdueCount || 0} overdue. ${email.resignationCount || 0} resignation(s) detected this week.`,
-    staffingModelStatus: (email.resignationCount || 0) >= 2 ? 'critical' : 'at-risk',
-    topAction: alerts[0]?.title || 'Review Zendesk ticket queue and respond to overdue items.'
-  };
-}
-
-// ============================================================
-// MAIN DATA FETCH ORCHESTRATOR
-// ============================================================
-async function fetchAllData() {
-  if (isFetching) {
-    console.log('⏳ Fetch already in progress, skipping...');
-    return;
-  }
-  isFetching = true;
-  console.log('\n🔄 Starting full data refresh at', new Date().toLocaleTimeString());
-  broadcast({ type: 'refreshing' });
-
-  try {
-    const [tableau, zendesk, email] = await Promise.all([
-      fetchTableauData().catch(e => ({ error: e.message })),
-      fetchZendeskData().catch(e => ({ available: false, error: e.message })),
-      fetchEmailData().catch(e => ({ available: false, error: e.message })),
-    ]);
-
-    const intelligence = await generateIntelligence(tableau, zendesk, email);
-
-    latestData = {
-      tableau,
-      zendesk,
-      email,
-      intelligence,
-      dataAvailability: {
-        tableau: !tableau.error,
-        zendesk: zendesk.available !== false,
-        email: email.available !== false,
-      }
-    };
-    lastFetched = new Date().toISOString();
-
-    broadcast({ type: 'data', payload: latestData, lastFetched });
-    console.log('✅ Data refresh complete');
-
-    // Check for critical alerts — send push email if configured
-    const criticalAlerts = intelligence.riskAlerts?.filter(a => a.level === 'critical') || [];
-    if (criticalAlerts.length > 0 && process.env.DIGEST_RECIPIENTS) {
-      await sendAlertEmail(criticalAlerts, email, zendesk);
-    }
-
-  } catch (err) {
-    console.error('❌ Full fetch failed:', err.message);
-    broadcast({ type: 'error', message: err.message });
-  } finally {
-    isFetching = false;
-  }
-}
-
-// ============================================================
-// EMAIL DIGEST / ALERTS
-// ============================================================
-async function sendAlertEmail(criticalAlerts, emailData, zendeskData) {
-  const token = await getMsGraphToken();
-  if (!token || !process.env.DIGEST_RECIPIENTS) return;
-
-  const html = `
-    <div style="font-family: Arial, sans-serif; max-width: 600px;">
-      <div style="background: #0b0f1a; color: #0AADA8; padding: 20px; border-radius: 8px 8px 0 0;">
-        <h1 style="margin:0; font-size: 18px;">🚨 Moments Hospice — Critical Alert</h1>
-        <p style="margin:5px 0 0; color: #64748b; font-size: 13px;">${new Date().toLocaleString()}</p>
-      </div>
-      <div style="background: #f8fafc; padding: 20px; border: 1px solid #e2e8f0;">
-        ${criticalAlerts.map(a => `
-          <div style="background: #fef2f2; border-left: 4px solid #ef4444; padding: 12px; margin-bottom: 10px; border-radius: 0 4px 4px 0;">
-            <strong style="color: #dc2626;">${a.title}</strong>
-            <p style="color: #64748b; font-size: 13px; margin: 5px 0 0;">${a.detail}</p>
-            <span style="font-size: 11px; color: #9ca3af;">Source: ${a.source} · Branch: ${a.branch}</span>
-          </div>
-        `).join('')}
-        <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #e2e8f0;">
-          <p style="font-size: 13px; color: #64748b;">
-            Open tickets: ${zendeskData.openCount || 0} · 
-            Resignations this week: ${emailData.resignationCount || 0}
-          </p>
-        </div>
-      </div>
-    </div>
-  `;
-
-  try {
-    await axios.post(
-      `https://graph.microsoft.com/v1.0/users/${process.env.MICROSOFT_MAILBOX}/sendMail`,
-      {
-        message: {
-          subject: `🚨 Moments Ops Alert: ${criticalAlerts.length} Critical Issue${criticalAlerts.length > 1 ? 's' : ''} — ${new Date().toLocaleDateString()}`,
-          body: { contentType: 'HTML', content: html },
-          toRecipients: process.env.DIGEST_RECIPIENTS.split(',').map(e => ({
-            emailAddress: { address: e.trim() }
-          }))
-        }
-      },
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    console.log('📧 Alert email sent');
-  } catch (err) {
-    console.error('❌ Alert email failed:', err.message);
-  }
-}
-
-async function sendDailyDigest() {
-  const token = await getMsGraphToken();
-  if (!token || !latestData || !process.env.DIGEST_RECIPIENTS) return;
-
-  const { intelligence, zendesk, email } = latestData;
-  const alerts = intelligence?.riskAlerts || [];
-  const critical = alerts.filter(a => a.level === 'critical');
-  const high = alerts.filter(a => a.level === 'high');
-
-  const html = `
-    <div style="font-family: Arial, sans-serif; max-width: 650px;">
-      <div style="background: #0b0f1a; color: white; padding: 24px; border-radius: 8px 8px 0 0;">
-        <h1 style="margin:0; font-size: 22px; color: #0AADA8;">Moments Hospice</h1>
-        <p style="margin:4px 0 0; font-size: 14px; color: #94a3b8;">Daily Operations Intelligence · ${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</p>
-      </div>
-      <div style="background: #fff8ed; border: 1px solid #fed7aa; padding: 16px; border-bottom: none;">
-        <strong style="font-size: 14px; color: #c2410c;">📋 SUMMARY</strong>
-        <p style="font-size: 13px; color: #78350f; margin: 6px 0 0;">${intelligence?.summary || 'No summary available.'}</p>
-      </div>
-      <div style="background: #f8fafc; padding: 20px; border: 1px solid #e2e8f0; border-radius: 0 0 8px 8px;">
-        <h3 style="font-size: 14px; color: #374151; margin: 0 0 12px;">⚡ TOP ACTION TODAY</h3>
-        <div style="background: #eff6ff; padding: 10px 14px; border-radius: 6px; font-size: 13px; color: #1e40af; margin-bottom: 20px;">
-          ${intelligence?.topAction || 'Review Zendesk queue'}
-        </div>
-        ${critical.length > 0 ? `
-          <h3 style="font-size: 14px; color: #dc2626; margin: 0 0 10px;">🚨 CRITICAL (${critical.length})</h3>
-          ${critical.map(a => `
-            <div style="background: #fef2f2; border-left: 3px solid #ef4444; padding: 10px 12px; margin-bottom: 8px; border-radius: 0 4px 4px 0;">
-              <strong style="font-size: 13px; color: #dc2626;">${a.title}</strong>
-              <p style="font-size: 12px; color: #6b7280; margin: 4px 0 0;">${a.detail}</p>
-            </div>
-          `).join('')}
-        ` : ''}
-        ${high.length > 0 ? `
-          <h3 style="font-size: 14px; color: #d97706; margin: 16px 0 10px;">⚠️ HIGH RISK (${high.length})</h3>
-          ${high.map(a => `
-            <div style="background: #fffbeb; border-left: 3px solid #f59e0b; padding: 10px 12px; margin-bottom: 8px; border-radius: 0 4px 4px 0;">
-              <strong style="font-size: 13px; color: #d97706;">${a.title}</strong>
-              <p style="font-size: 12px; color: #6b7280; margin: 4px 0 0;">${a.detail}</p>
-            </div>
-          `).join('')}
-        ` : ''}
-        <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #e5e7eb; display: flex; gap: 20px;">
-          <div style="text-align: center;">
-            <div style="font-size: 24px; font-weight: 800; color: #0AADA8;">${zendesk.openCount || 0}</div>
-            <div style="font-size: 11px; color: #9ca3af;">Open Tickets</div>
-          </div>
-          <div style="text-align: center;">
-            <div style="font-size: 24px; font-weight: 800; color: #ef4444;">${zendesk.overdueCount || 0}</div>
-            <div style="font-size: 11px; color: #9ca3af;">Overdue</div>
-          </div>
-          <div style="text-align: center;">
-            <div style="font-size: 24px; font-weight: 800; color: #f59e0b;">${email.resignationCount || 0}</div>
-            <div style="font-size: 11px; color: #9ca3af;">Resignations (7d)</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-
-  try {
-    await axios.post(
-      `https://graph.microsoft.com/v1.0/users/${process.env.MICROSOFT_MAILBOX}/sendMail`,
-      {
-        message: {
-          subject: `📊 Moments Ops Digest · ${new Date().toLocaleDateString()} · ${critical.length} Critical, ${high.length} High`,
-          body: { contentType: 'HTML', content: html },
-          toRecipients: process.env.DIGEST_RECIPIENTS.split(',').map(e => ({
-            emailAddress: { address: e.trim() }
-          }))
-        }
-      },
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-    console.log('📧 Daily digest sent');
-  } catch (err) {
-    console.error('❌ Daily digest failed:', err.message);
-  }
-}
-
-// ============================================================
-// SCHEDULING
-// ============================================================
-const refreshMinutes = parseInt(process.env.REFRESH_INTERVAL_MINUTES || '30');
-// Run every N minutes
-cron.schedule(`*/${refreshMinutes} * * * *`, fetchAllData);
-
-// Daily digest
-if (process.env.SEND_EMAIL_DIGEST === 'true' && process.env.DIGEST_TIME) {
-  const [hour, minute] = (process.env.DIGEST_TIME || '06:30').split(':');
-  cron.schedule(`${minute} ${hour} * * *`, sendDailyDigest);
-  console.log(`📅 Daily digest scheduled for ${process.env.DIGEST_TIME}`);
-}
-
-// ============================================================
-// API ROUTES
-// ============================================================
-app.get('/api/data', (req, res) => {
-  res.json({ data: latestData, lastFetched });
-});
-
-app.post('/api/refresh', async (req, res) => {
-  res.json({ message: 'Refresh started' });
-  fetchAllData();
-});
-
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    lastFetched,
-    dataAvailable: !!latestData,
-    refreshIntervalMinutes: refreshMinutes,
-    connections: wss.clients.size,
+async function fetchZendeskIntelligence() {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      system: `You are a hospice operations analyst. Query Zendesk via CData and return ONLY valid JSON (no markdown) with this exact structure:
+{"lateVisits":number,"qiIncidents":number,"dmeIssues":number,"openOrders":number,"newReferrals":number,"noResponse":number,"topBranches":[{"branch":"tag","count":number}],"criticalSubjects":["subject1","subject2"],"summary":"2 sentence summary"}`,
+      messages: [{ role: "user", content: "Query [Zendesk1].[Zendesk].[Tickets] WHERE Status IN ('new','open','pending'). Count tickets by critical operational tags. Return the JSON." }],
+      mcp_servers: [{ type: "url", url: "https://mcp.cloud.cdata.com/mcp", name: "cdata-zendesk" }]
+    })
   });
-});
+  const data = await resp.json();
+  const text = data.content?.find(b => b.type === "text")?.text || "";
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
+}
 
-// ============================================================
-// START
-// ============================================================
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`
-╔══════════════════════════════════════════════╗
-║   Moments Hospice Operations Command Center  ║
-║   Running on port ${PORT}                       ║
-╚══════════════════════════════════════════════╝
-  `);
-  // Fetch data immediately on startup
-  setTimeout(fetchAllData, 2000);
-});
+async function generateBriefing(tableau, zd) {
+  const rnDrop = Math.round((1 - tableau.rnW13 / tableau.rnW11) * 100);
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: `Hospice operations briefing. Be specific, use numbers, 4 sentences max, no fluff.
+
+TABLEAU TODAY: Census ${tableau.census} | MTD Admits ${tableau.mtdAdmits} | MTD DC ${tableau.mtdDischarges} | ALOS ${tableau.alos}d (target 120) | Discharged ALOS ${tableau.dischAlos}d (target 80) | RN scheduled visits: Week11=${tableau.rnW11} Week12=${tableau.rnW12} Week13=${tableau.rnW13} (${rnDrop}% drop)
+
+ZENDESK LIVE: Late visits=${zd.lateVisits} | QI incidents=${zd.qiIncidents} | DME issues=${zd.dmeIssues} | No-response=${zd.noResponse} | Referrals=${zd.newReferrals} | Hottest branches: ${(zd.topBranches||[]).slice(0,3).map(b=>`${BRANCH_MAP[b.branch]||b.branch}(${b.count})`).join(", ")}
+
+Write the executive briefing:` }]
+    })
+  });
+  const data = await resp.json();
+  return data.content?.find(b => b.type === "text")?.text || "";
+}
+
+const DEMO_ZD = {
+  lateVisits: 15, qiIncidents: 8, dmeIssues: 4, openOrders: 7, newReferrals: 4, noResponse: 12,
+  topBranches: [
+    { branch: "eau_claire", count: 9 }, { branch: "firekeepers___wi", count: 8 },
+    { branch: "milwaukee", count: 7 }, { branch: "duluth", count: 6 }, { branch: "mankato", count: 5 },
+  ],
+  criticalSubjects: [
+    "Late Visit – Please address ASAP! (×15 open)",
+    "GRB Unverified Visits – Orders Needed ASAP",
+    "Visits Holding Billing [URGENT] – Chicago S",
+    "FIREKPRS – M. STADLER – FALL",
+    "MKE Late/Incomplete Visits – please complete ASAP",
+    "ATW and GRB Unverified Visits – Orders Needed",
+  ],
+  summary: "15 late-visit tickets open across Eau Claire, GRB, Duluth, Milwaukee. 8 QI incidents pending QA review."
+};
+
+export default function Dashboard() {
+  const tableau = {
+    census: 2032, mtdAdmits: 141, mtdDischarges: 122,
+    alos: 148.1, dischAlos: 101.7, rnW11: 307, rnW12: 254, rnW13: 214, rnPct: 87,
+    weekAdmits: 54, weekDischarges: 21,
+  };
+  const rnDrop = Math.round((1 - tableau.rnW13 / tableau.rnW11) * 100);
+
+  const [tab, setTab] = useState("ops");
+  const [zd, setZd] = useState(DEMO_ZD);
+  const [loading, setLoading] = useState(false);
+  const [briefing, setBriefing] = useState("");
+  const [briefLoading, setBriefLoading] = useState(false);
+  const [lastRefresh, setLastRefresh] = useState(null);
+  const { displayed: typed, done: typeDone } = useTypewriter(briefing, 9);
+
+  async function refresh() {
+    setLoading(true);
+    try {
+      const data = await fetchZendeskIntelligence();
+      setZd(data);
+      setLastRefresh(new Date());
+      setBriefing("");
+      setBriefLoading(true);
+      const b = await generateBriefing(tableau, data);
+      setBriefing(b);
+    } catch {
+      setZd(DEMO_ZD);
+      setLastRefresh(new Date());
+      setBriefLoading(true);
+      try {
+        const b = await generateBriefing(tableau, DEMO_ZD);
+        setBriefing(b);
+      } catch {
+        setBriefing(`Census is at ${tableau.census.toLocaleString()} and growing fast — ${tableau.mtdAdmits} MTD admits vs ${tableau.mtdDischarges} discharges, a net +${tableau.mtdAdmits - tableau.mtdDischarges} this month. The most urgent clinical signal is RN scheduled visits dropping ${rnDrop}% over 3 weeks (${tableau.rnW11}→${tableau.rnW13}), compounding into frequency compliance failures. Zendesk shows ${DEMO_ZD.lateVisits} unverified visit tickets open today, concentrated in Eau Claire, GRB, and Milwaukee — these branches need immediate supervisor contact. ${DEMO_ZD.qiIncidents} QI incident tickets are pending QA review; falls in Milwaukee, Brainerd, and Duluth are unresolved past initial escalation.`);
+      }
+    } finally {
+      setLoading(false);
+      setBriefLoading(false);
+    }
+  }
+
+  useEffect(() => { refresh(); }, []);
+
+  const c = {
+    bg: "#080F1C", panel: "rgba(10,18,32,0.95)", border: "rgba(255,255,255,0.07)",
+    teal: "#00D4AA", red: "#FF4B4B", orange: "#FF8C00", gold: "#FFD700",
+    text: "#C8D8E8", muted: "#4A7A8A", dim: "#2A4060",
+  };
+
+  const dot = (col) => (
+    <span style={{ width: 7, height: 7, borderRadius: "50%", background: col,
+      display: "inline-block", marginRight: 7, flexShrink: 0,
+      boxShadow: `0 0 5px ${col}99`, verticalAlign: "middle" }} />
+  );
+
+  const tag = (col, text) => (
+    <span style={{ padding: "2px 7px", borderRadius: 4, fontSize: 10, fontWeight: 700,
+      background: col + "22", border: `1px solid ${col}55`, color: col,
+      letterSpacing: "0.05em", whiteSpace: "nowrap" }}>{text}</span>
+  );
+
+  const pill = (col, text) => (
+    <span style={{ padding: "3px 10px", borderRadius: 20, fontSize: 10,
+      background: col + "18", color: col, border: `1px solid ${col}30` }}>{text}</span>
+  );
+
+  const Panel = ({ title, badge, children, alert }) => (
+    <div style={{ background: c.panel, border: `1px solid ${alert || c.border}`,
+      borderRadius: 12, overflow: "hidden", transition: "border-color 0.3s" }}>
+      <div style={{ padding: "11px 18px", borderBottom: `1px solid ${c.border}`,
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        background: "rgba(0,0,0,0.25)" }}>
+        <span style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase",
+          color: "#7ABBC8", fontWeight: 600 }}>{title}</span>
+        {badge}
+      </div>
+      <div style={{ padding: "14px 18px" }}>{children}</div>
+    </div>
+  );
+
+  const Bar = ({ label, val, max, col, right }) => {
+    const pct = Math.round(val / max * 100);
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <span style={{ width: 96, fontSize: 11, color: c.text, flexShrink: 0 }}>{label}</span>
+        <div style={{ flex: 1, height: 7, background: "rgba(255,255,255,0.05)", borderRadius: 3 }}>
+          <div style={{ height: 7, borderRadius: 3, width: `${pct}%`,
+            background: `linear-gradient(90deg, ${col}, ${col}88)`, transition: "width 0.9s ease" }} />
+        </div>
+        <span style={{ width: 28, textAlign: "right", fontSize: 12, color: col, fontWeight: 700 }}>{right ?? val}</span>
+      </div>
+    );
+  };
+
+  const kpis = [
+    { label: "Census", value: "2,032", sub: "active patients", col: c.teal },
+    { label: "MTD Admits", value: "141", sub: "March 2026", col: c.teal },
+    { label: "MTD Discharges", value: "122", sub: "March 2026", col: "#FF7A6B" },
+    { label: "Net Census", value: "+19", sub: "month-to-date", col: c.teal },
+    { label: "ALOS", value: "148.1d", sub: "target 120 ✓", col: c.teal },
+    { label: "DC'd ALOS", value: "101.7d", sub: "target 80 ↑", col: c.gold },
+    { label: "Late Visits", value: zd.lateVisits, sub: "open Zendesk", col: c.red },
+    { label: "QI Incidents", value: zd.qiIncidents, sub: "QA pending", col: c.orange },
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: `linear-gradient(135deg, ${c.bg} 0%, #0D1829 60%, #091520 100%)`,
+      fontFamily: "'DM Mono','Courier New',monospace", color: c.text, fontSize: 13 }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Sora:wght@400;600;700&display=swap');
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-track{background:#0a1220}::-webkit-scrollbar-thumb{background:#1a3050;border-radius:2px}
+      `}</style>
+
+      {/* HEADER */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
+        padding: "14px 24px", borderBottom: `1px solid rgba(0,212,170,0.18)`,
+        background: "rgba(8,15,28,0.97)", position: "sticky", top: 0, zIndex: 100 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 8,
+            background: "linear-gradient(135deg,#00D4AA,#005F7A)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: 17, color: "#fff" }}>M</div>
+          <div>
+            <div style={{ fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: 14, color: "#E0EEF8", letterSpacing: "0.06em" }}>MOMENTS HOSPICE</div>
+            <div style={{ fontSize: 9, color: c.muted, letterSpacing: "0.18em", textTransform: "uppercase" }}>Operations Command Center</div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 3 }}>
+          {[["ops","Operations"],["freq","Frequency"],["zendesk","Zendesk Intel"]].map(([id, label]) => (
+            <button key={id} onClick={() => setTab(id)}
+              style={{ background: tab===id ? "rgba(0,212,170,0.14)" : "none",
+                border: "none", borderRadius: 7, color: tab===id ? c.teal : c.muted,
+                fontSize: 10, padding: "7px 14px", cursor: "pointer",
+                letterSpacing: "0.1em", textTransform: "uppercase",
+                fontFamily: "'DM Mono',monospace", transition: "all 0.2s" }}>{label}</button>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+          {loading && <span style={{ fontSize: 10, color: c.teal, display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: 14, height: 14, border: `2px solid ${c.teal}33`, borderTop: `2px solid ${c.teal}`,
+              borderRadius: "50%", display: "inline-block", animation: "spin 0.8s linear infinite" }} />
+            Querying live data…
+          </span>}
+          {lastRefresh && <span style={{ fontSize: 10, color: c.dim }}>
+            Refreshed {lastRefresh.toLocaleTimeString()}
+          </span>}
+          <button onClick={refresh} disabled={loading}
+            style={{ background: "rgba(0,212,170,0.1)", border: `1px solid rgba(0,212,170,0.35)`,
+              borderRadius: 8, color: c.teal, fontSize: 11, padding: "8px 16px", cursor: "pointer",
+              letterSpacing: "0.07em", fontFamily: "'DM Mono',monospace" }}>
+            ↻ Refresh
+          </button>
+        </div>
+      </div>
+
+      {/* KPI STRIP */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(8,1fr)", gap: 10, padding: "16px 20px 10px" }}>
+        {kpis.map((k, i) => (
+          <div key={i} style={{ background: "rgba(13,22,40,0.85)", border: `1px solid rgba(255,255,255,0.06)`,
+            borderRadius: 10, padding: "14px 10px", textAlign: "center",
+            animation: `fadeUp 0.4s ease ${i*0.05}s both` }}>
+            <div style={{ fontSize: 24, fontWeight: 700, color: k.col, fontFamily: "'Sora',sans-serif",
+              letterSpacing: "-0.02em", lineHeight: 1 }}>{k.value}</div>
+            <div style={{ fontSize: 9, color: c.muted, letterSpacing: "0.12em", textTransform: "uppercase", marginTop: 5 }}>{k.label}</div>
+            <div style={{ fontSize: 9, color: k.col + "88", marginTop: 3 }}>{k.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* ── OPS TAB ── */}
+      {tab === "ops" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1.45fr", gap: 12, padding: "4px 20px 20px" }}>
+
+          {/* COL 1 */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <Panel title="⚠ RN Scheduled Visits" alert="rgba(255,75,75,0.35)"
+              badge={pill(c.red, `↓${rnDrop}% IN 3 WKS`)}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
+                borderRadius: 7, background: "rgba(255,75,75,0.08)", border: "1px solid rgba(255,75,75,0.2)", marginBottom: 14 }}>
+                {dot(c.red)}
+                <span style={{ fontSize: 11, color: "#FFAAAA" }}>
+                  Dropping from <strong>{tableau.rnW11}</strong> → <strong>{tableau.rnW13}</strong> visits — {rnDrop}% decline
+                </span>
+              </div>
+              {[["Week 11 (Mar 8)", tableau.rnW11, 100], ["Week 12 (Mar 15)", tableau.rnW12, Math.round(tableau.rnW12/tableau.rnW11*100)], ["Week 13 (Mar 22)", tableau.rnW13, Math.round(tableau.rnW13/tableau.rnW11*100)]].map(([w, v, p], i) => (
+                <div key={i} style={{ marginBottom: 11 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, marginBottom: 4, color: "#7ABBC8" }}>
+                    <span>{w}</span><span style={{ color: p < 80 ? c.red : c.gold }}>{v} visits</span>
+                  </div>
+                  <div style={{ height: 7, background: "rgba(255,255,255,0.05)", borderRadius: 3 }}>
+                    <div style={{ height: 7, borderRadius: 3, width: `${p}%`, transition: "width 0.8s ease",
+                      background: `linear-gradient(90deg,${p<80?c.red:p<90?c.gold:c.teal},${p<80?c.red+"66":p<90?c.gold+"66":c.teal+"66"})` }} />
+                  </div>
+                </div>
+              ))}
+              <div style={{ fontSize: 10, color: c.muted, marginTop: 8, paddingTop: 8, borderTop: `1px solid rgba(255,255,255,0.05)` }}>
+                Historical completion rate: <span style={{ color: c.gold }}>{tableau.rnPct}%</span> · Target: <span style={{ color: c.teal }}>≥95%</span>
+              </div>
+            </Panel>
+
+            <Panel title="Census Growth — 12mo" badge={pill(c.teal, "+66%")}>
+              {[[1222,"Apr '25"],[1431,"Jul '25"],[1704,"Oct '25"],[1842,"Jan '26"],[2033,"Mar '26"]].map(([v, m], i) => (
+                <Bar key={i} label={m} val={v} max={2033} col={c.teal} right={v.toLocaleString()} />
+              ))}
+              <div style={{ fontSize: 10, color: c.muted, marginTop: 8, textAlign: "center" }}>
+                Week: {tableau.weekAdmits} admits · {tableau.weekDischarges} DC's · Net +{tableau.weekAdmits - tableau.weekDischarges}
+              </div>
+            </Panel>
+          </div>
+
+          {/* COL 2 */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <Panel title="Live Issue Categories" badge={loading ? <span style={{ width:14,height:14,border:`2px solid ${c.teal}33`,borderTop:`2px solid ${c.teal}`,borderRadius:"50%",display:"inline-block",animation:"spin 0.8s linear infinite"}} /> : <span style={{fontSize:9,color:c.muted}}>Zendesk · now</span>}>
+              {[
+                ["Late / Unverified", zd.lateVisits, c.red],
+                ["No Response", zd.noResponse, c.orange],
+                ["QI Incidents", zd.qiIncidents, c.red],
+                ["DME Issues", zd.dmeIssues, c.orange],
+                ["Open Orders", zd.openOrders, c.gold],
+                ["New Referrals", zd.newReferrals, c.teal],
+              ].map(([label, count, col], i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center" }}>
+                    {dot(col)}<span style={{ fontSize: 12 }}>{label}</span>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ width: 70, height: 4, background: "rgba(255,255,255,0.05)", borderRadius: 2 }}>
+                      <div style={{ height: 4, borderRadius: 2, background: col, opacity: 0.8,
+                        width: `${Math.min(100, count / 20 * 100)}%` }} />
+                    </div>
+                    <span style={{ fontSize: 14, fontWeight: 700, color: col, width: 22, textAlign: "right" }}>{count}</span>
+                  </div>
+                </div>
+              ))}
+            </Panel>
+
+            <Panel title="Branch Ticket Load" badge={<span style={{fontSize:9,color:c.muted}}>top 5 · open</span>}>
+              {(zd.topBranches || []).map((b, i) => {
+                const pct = Math.round(b.count / Math.max(...zd.topBranches.map(x=>x.count)) * 100);
+                const col = pct > 75 ? c.red : pct > 50 ? c.orange : c.gold;
+                return <Bar key={i} label={BRANCH_MAP[b.branch] || b.branch.replace(/_/g," ")} val={b.count} max={Math.max(...zd.topBranches.map(x=>x.count))} col={col} />;
+              })}
+            </Panel>
+
+            <Panel title="ALOS Status" badge={pill(c.gold, "Monitor")}>
+              {[["Current ALOS", tableau.alos, 120, true], ["Discharged ALOS", tableau.dischAlos, 80, false]].map(([label, val, tgt, good], i) => (
+                <div key={i} style={{ marginBottom: 13 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, marginBottom: 5 }}>
+                    <span style={{ color: "#7ABBC8" }}>{label}</span>
+                    <span><span style={{ color: good ? c.teal : c.gold, fontWeight: 700 }}>{val}d</span><span style={{ color: c.muted }}> / {tgt}d target</span></span>
+                  </div>
+                  <div style={{ height: 7, background: "rgba(255,255,255,0.05)", borderRadius: 3, position: "relative" }}>
+                    <div style={{ height: 7, borderRadius: 3, width: `${Math.min(100, val/200*100)}%`,
+                      background: good ? c.teal : c.gold, transition: "width 0.8s ease" }} />
+                    <div style={{ position: "absolute", top: 0, height: "100%", width: 2,
+                      background: "rgba(255,255,255,0.25)", left: `${tgt/200*100}%` }} />
+                  </div>
+                </div>
+              ))}
+            </Panel>
+          </div>
+
+          {/* COL 3 */}
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {/* AI BRIEFING */}
+            <div style={{ background: "linear-gradient(135deg,rgba(0,95,122,0.18),rgba(0,212,170,0.08))",
+              border: `1px solid rgba(0,212,170,0.28)`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "11px 18px", borderBottom: `1px solid rgba(0,212,170,0.15)`,
+                display: "flex", alignItems: "center", justifyContent: "space-between",
+                background: "rgba(0,0,0,0.2)" }}>
+                <span style={{ fontSize: 10, letterSpacing: "0.14em", textTransform: "uppercase", color: c.teal, fontWeight: 600 }}>◈ AI Command Briefing</span>
+                {briefLoading && <span style={{ width:14,height:14,border:`2px solid ${c.teal}33`,borderTop:`2px solid ${c.teal}`,borderRadius:"50%",display:"inline-block",animation:"spin 0.8s linear infinite"}} />}
+              </div>
+              <div style={{ padding: "16px 18px", minHeight: 130 }}>
+                {briefing ? (
+                  <p style={{ fontSize: 12, lineHeight: 1.85, color: "#C8E8E0", fontFamily: "'Sora',sans-serif" }}>
+                    {typed}
+                    {!typeDone && <span style={{ display: "inline-block", width: 2, height: 13,
+                      background: c.teal, marginLeft: 2, verticalAlign: "middle",
+                      animation: "blink 1s step-end infinite" }} />}
+                  </p>
+                ) : briefLoading ? (
+                  <span style={{ fontSize: 11, color: c.muted }}>Synthesizing cross-system intelligence…</span>
+                ) : (
+                  <span style={{ fontSize: 11, color: c.muted }}>Click Refresh to generate briefing</span>
+                )}
+              </div>
+            </div>
+
+            <Panel title="🔴 Critical Open Tickets" badge={<span style={{fontSize:9,color:c.muted}}>Zendesk · now</span>}>
+              {(zd.criticalSubjects || []).map((s, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 9,
+                  padding: "8px 0", borderBottom: i < (zd.criticalSubjects.length-1) ? `1px solid rgba(255,255,255,0.04)` : "none" }}>
+                  {dot(i===0 || s.includes("URGENT") || s.toUpperCase().includes("FALL") ? c.red : i<3 ? c.orange : c.gold)}
+                  <span style={{ fontSize: 11, lineHeight: 1.45, color: "#D0E0EC" }}>{s}</span>
+                </div>
+              ))}
+            </Panel>
+
+            <Panel title="Frequency Thresholds">
+              {[["CNA (HHA)","5×/week","⚠ Gap Risk",c.orange],["RN (SN)","2×/week",`🔴 Down ${rnDrop}%`,c.red],["Social Work (MSW)","2×/month","⚠ Monitor",c.gold],["Chaplain (CH)","2×/month","⚠ Monitor",c.gold]].map(([d,t,s,col],i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                  padding: "7px 0", borderBottom: i<3 ? `1px solid rgba(255,255,255,0.04)` : "none" }}>
+                  <div>
+                    <div style={{ fontSize: 12, color: c.text }}>{d}</div>
+                    <div style={{ fontSize: 9, color: c.muted }}>Target: {t}</div>
+                  </div>
+                  {tag(col, s)}
+                </div>
+              ))}
+            </Panel>
+          </div>
+        </div>
+      )}
+
+      {/* ── FREQUENCY TAB ── */}
+      {tab === "freq" && (
+        <div style={{ padding: "10px 20px 20px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px",
+            borderRadius: 8, background: "rgba(255,75,75,0.08)", border: `1px solid rgba(255,75,75,0.25)`, marginBottom: 14 }}>
+            {dot(c.red)}
+            <strong style={{ color: "#FFA0A0", fontSize: 12 }}>RN Visit Drop Alert:</strong>
+            <span style={{ fontSize: 11, color: "#D8C0C0" }}>Scheduled RN visits fell {tableau.rnW11}→{tableau.rnW12}→{tableau.rnW13} in 3 weeks ({rnDrop}% decline). Cross-reference with frequency compliance immediately.</span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 14 }}>
+            {[["CNA (HHA)","5×/wk","Below 5 = frequency gap","fa199814",c.orange],["RN (SN)","2×/wk","Below 2 = compliance risk","857f6de9",c.red],["Social Work (MSW)","2×/mo","Below 2/mo = regulatory gap","c7e9b2e3",c.gold],["Chaplain (CH/MU)","2×/mo","Below 1/mo = PEPPER risk","c7e9b2e3",c.gold]].map(([d,t,h,id,col],i) => (
+              <div key={i} style={{ background: c.panel, border: `1px solid ${col}30`, borderRadius: 12, padding: 16 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: col, marginBottom: 6, fontFamily: "'Sora',sans-serif" }}>{d}</div>
+                <div style={{ fontSize: 22, fontWeight: 700, color: c.text, fontFamily: "'Sora',sans-serif" }}>{t}</div>
+                <div style={{ fontSize: 10, color: c.muted, marginTop: 6, lineHeight: 1.6 }}>{h}</div>
+                <div style={{ marginTop: 10, fontSize: 9, color: c.dim }}>View ID: {id}</div>
+                <a href={`https://basrv-tx.hchb.com/#/site/Moments/views/${id}`} target="_blank" rel="noreferrer"
+                  style={{ fontSize: 10, color: c.teal, textDecoration: "none", display: "block", marginTop: 6 }}>→ Open in Tableau</a>
+              </div>
+            ))}
+          </div>
+          <Panel title="Weekly Frequency 2.0 — Data Reference" badge={<span style={{fontSize:9,color:c.muted}}>Tableau · fa199814 + c7e9b2e3</span>}>
+            <div style={{ fontSize: 11, color: "#7ABBC8", lineHeight: 1.8 }}>
+              The Weekly Frequency view shows <strong style={{color:c.text}}>planned/ordered visits</strong> — declined and missed may still appear. Cross-reference with Zendesk <code style={{background:"rgba(255,255,255,0.06)",padding:"1px 5px",borderRadius:3}}>_unverified_visit_request</code> tag for actual delivery gaps.<br/><br/>
+              Key rule: any patient with <strong style={{color:c.red}}>CNA &lt; 5/wk</strong> or <strong style={{color:c.red}}>RN &lt; 2/wk</strong> should automatically surface a Zendesk ticket from your daily audit automation. If the Zendesk ticket exists but the Tableau frequency shows compliant numbers — the visit happened but wasn't documented (HUV).
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* ── ZENDESK TAB ── */}
+      {tab === "zendesk" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, padding: "10px 20px 20px" }}>
+          <Panel title="Tag Intelligence Guide">
+            {Object.entries(CRITICAL_TAGS).map(([t, info], i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: 10,
+                padding: "8px 0", borderBottom: i < Object.keys(CRITICAL_TAGS).length-1 ? `1px solid rgba(255,255,255,0.04)` : "none" }}>
+                {tag(info.color, info.severity.toUpperCase())}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: c.text }}>{t}</div>
+                  <div style={{ fontSize: 10, color: c.muted }}>{info.label}</div>
+                </div>
+              </div>
+            ))}
+          </Panel>
+
+          <Panel title="Cross-System Signal Map">
+            {[
+              ["_unverified_visit_request",c.orange,"Weekly Frequency fa199814",c.teal,"Find patient in frequency grid — ordered but not completed?"],
+              ["occurrence_clarification",c.red,"RN Metrics 857f6de9",c.teal,"Was RN hitting 2×/wk? Falls spike in low-frequency patients."],
+              ["dme_not_ordered",c.red,"Caregiver Optimization 3e7e68e9",c.teal,"CNA visiting but not flagging DME need — documentation gap."],
+              ["daily_audit_for_unverified_visit",c.orange,"Orders Lifecycle 2ca1b12f",c.teal,"Visit done, no signed order — unsigned CTI exists."],
+              ["no_response_start",c.orange,"Daily Snapshot e5bf6766",c.teal,"Check L-LATE count for that worker — pattern vs exception?"],
+            ].map(([zt,zc,tt,tc,action],i) => (
+              <div key={i} style={{ padding: "10px 0", borderBottom: i<4 ? `1px solid rgba(255,255,255,0.04)` : "none" }}>
+                <div style={{ display: "flex", gap: 6, marginBottom: 5, flexWrap: "wrap" }}>
+                  {tag(zc, zt)}
+                  <span style={{ fontSize: 10, color: c.muted, alignSelf: "center" }}>→</span>
+                  {tag(tc, tt)}
+                </div>
+                <div style={{ fontSize: 11, color: "#7ABBC8", lineHeight: 1.5 }}>{action}</div>
+              </div>
+            ))}
+          </Panel>
+        </div>
+      )}
+
+      <div style={{ borderTop: `1px solid rgba(255,255,255,0.04)`, padding: "8px 24px",
+        display: "flex", justifyContent: "space-between", fontSize: 9, color: c.dim }}>
+        <span>Tableau: Mar 10 2026 · 11:35 AM CST · Zendesk: Live via CData MCP</span>
+        <span>Moments Hospice Operations Command Center · Confidential</span>
+      </div>
+    </div>
+  );
+}

@@ -48,6 +48,7 @@ wss.on('connection', (ws) => {
 // ============================================================
 let tableauAuthToken = null;
 let tableauTokenExpiry = null;
+let tableauSiteLuid = null; // The real UUID Tableau needs for API calls
 
 async function getTableauToken() {
   if (tableauAuthToken && tableauTokenExpiry && Date.now() < tableauTokenExpiry) {
@@ -65,9 +66,10 @@ async function getTableauToken() {
       }
     );
     tableauAuthToken = res.data.credentials.token;
-    // Tokens last 240 minutes; refresh every 200 to be safe
+    // Capture the site LUID (UUID) — this is what the REST API actually needs
+    tableauSiteLuid = res.data.credentials.site.id;
     tableauTokenExpiry = Date.now() + 200 * 60 * 1000;
-    console.log('✅ Tableau auth token refreshed');
+    console.log('✅ Tableau auth token refreshed, site LUID:', tableauSiteLuid);
     return tableauAuthToken;
   } catch (err) {
     console.error('❌ Tableau auth failed:', err.message);
@@ -77,10 +79,10 @@ async function getTableauToken() {
 
 async function getTableauViewData(viewId) {
   const token = await getTableauToken();
-  if (!token) return null;
+  if (!token || !tableauSiteLuid) return null;
   try {
     const res = await axios.get(
-      `${process.env.TABLEAU_SERVER}/api/3.21/sites/${process.env.TABLEAU_SITE_ID}/views/${viewId}/data`,
+      `${process.env.TABLEAU_SERVER}/api/3.21/sites/${tableauSiteLuid}/views/${viewId}/data`,
       {
         headers: { 'X-Tableau-Auth': token },
         params: { maxAge: 5 } // allow up to 5 min cached extract
@@ -163,7 +165,7 @@ async function fetchZendeskData() {
   }
   console.log('📞 Fetching Zendesk data...');
 
-  const base = `https://${process.env.ZENDESK_SUBDOMAIN}.zendesk.com/api/v2`;
+  const base = `https://${process.env.ZENDESK_SUBDOMAIN.replace(/^https?:\/\//, '').replace('.zendesk.com', '')}.zendesk.com/api/v2`;
   const auth = Buffer.from(`${process.env.ZENDESK_EMAIL}/token:${process.env.ZENDESK_API_TOKEN}`).toString('base64');
   const headers = { Authorization: `Basic ${auth}` };
 
@@ -439,7 +441,7 @@ ${(email.resignations || []).map(r => `  - ${r.from} (${r.branch}): "${r.subject
 Generate specific, actionable risk alerts. Flag visit frequency gaps (target CNA 5x/wk, RN 2x/wk, SW/Chaplain 2x/month), patient safety issues, staffing crises, and Zendesk escalations.`
         }]
       },
-      { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' } }
+      { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } }
     );
 
     const text = res.data.content?.[0]?.text || '';

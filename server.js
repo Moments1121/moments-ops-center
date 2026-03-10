@@ -113,9 +113,9 @@ function parseCSV(csv) {
 // Your actual Tableau View IDs from Moments Hospice site
 const TABLEAU_VIEWS = {
   keyMetricsSummary:    '19bb88d6-87df-4777-a793-e5b075c51390',
-  keyMetricsCensus:     '6c28bdb1-88a9-4b91-8d93-688fb6e7b5e3',
-  keyMetricsAdmitsDC:   '1ea28a4d-b203-4efa-8bfd-d67a05d03af5',
-  keyMetricsVisits:     '0e52fd10-10eb-44ee-964a-8fde3a4d7c5d',
+  keyMetricsCensus:     '83d74db5-a7dd-4069-9b87-eb07eca1a6b7', // Default project - no permission issue
+  keyMetricsAdmitsDC:   'a7f03568-243c-49a7-936c-12d72f4cda22', // Default project
+  keyMetricsVisits:     '36e87a3f-380e-4cb3-af55-408dd0cbdc3e', // Default project
   keyMetricsGrossMargin:'ea12fe7f-f607-4fca-a273-2e478b07119f',
   keyMetricsCostPerDay: '4323de7a-ab69-4fa8-b02a-3af0316e0b2c',
   visitPatterns:        '7fa1a9e7-04e5-4926-acf1-36852cd91db7', // Visits - Counts (Scheduling)

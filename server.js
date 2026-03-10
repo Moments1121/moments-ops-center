@@ -204,20 +204,58 @@ async function fetchTableauData() {
   const adcRows = adcAlos || [];
   const latestADC = adcRows.length ? parseFloat((adcRows[adcRows.length - 1]['Average Daily Census'] || '').replace(/,/g, '')) : null;
 
+  // ── BRANCH-LEVEL FREQUENCY MATRIX ─────────────────────────────
+  const branchMap = {};
+  for (const row of monthlyRows) {
+    const branch = row['Branch Code'];
+    const disc   = row['Discipline Code'];
+    const month  = row['Month of Visit Start Date'];
+    const freq   = parseFloat(row['Planned Frequency']);
+    if (!branch || !disc || month !== currentMonth || isNaN(freq) || freq <= 0 || freq >= 50) continue;
+    if (!branchMap[branch]) branchMap[branch] = {};
+    if (!branchMap[branch][disc]) branchMap[branch][disc] = [];
+    branchMap[branch][disc].push(freq);
+  }
+
+  const branchFrequency = Object.entries(branchMap).map(([code, discs]) => {
+    const ma  = discs['MA']  || [];
+    const msw = discs['MSW'] || [];
+    const ch  = discs['CH']  || [];
+    const avg = arr => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+    const pts = Math.max(ma.length, msw.length, ch.length, 1);
+    const cna = avg(ma);
+    const sw  = avg(msw);
+    const chv = avg(ch);
+    const issues = (cna == null || cna < 2 ? 1 : 0) + (sw != null && sw < 1.5 ? 1 : 0) + (chv != null && chv < 1.5 ? 1 : 0);
+    return {
+      code, patients: pts,
+      cna:    cna  != null ? parseFloat(cna.toFixed(2))  : null,
+      sw:     sw   != null ? parseFloat(sw.toFixed(2))   : null,
+      ch:     chv  != null ? parseFloat(chv.toFixed(2))  : null,
+      issues,
+      priority: issues >= 2 ? 'critical' : issues === 1 ? 'high' : 'ok',
+    };
+  }).sort((a, b) => b.patients - a.patients);
+
   return {
     census: census || [],
-    admitsDischarges: adcRows,        // monthly ADC trend
-    visits: rnRows,                   // RN weekly metrics
-    visitPatterns: weeklyFreq || [],  // weekly freq (large)
-    monthlyFrequency: monthlyRows,    // patient-level monthly planned freq
+    admitsDischarges: adcRows,
+    visits: rnRows,
+    visitPatterns: [],
+    monthlyFrequency: [],
     workerTurnover: workerTurnover || [],
-    disciplines,                       // ← processed summary sent to frontend
+    disciplines,
+    branchFrequency,
     currentCensus: (census || []).reduce((s, r) => {
       const v = parseFloat((r['Patient Count'] || '').replace(/,/g, ''));
       return s + (isNaN(v) ? 0 : v);
     }, 0),
     latestADC,
     rnCompletionRate: rnAvgCompletion,
+    rnWeeklyTrend: latestRNRows.map(r => ({
+      week: r['Week of Visit Start Date'],
+      pct:  parseFloat((parseFloat(r['Avg. count to completed']) * 100).toFixed(1)),
+    })),
   };
 }
 

@@ -123,22 +123,68 @@ const TABLEAU_VIEWS = {
 
 async function fetchTableauData() {
   console.log('📊 Fetching Tableau data...');
-  const [census, admitsDC, visits, visitPatterns, monthlyFreq, workerTurnover] = await Promise.all([
-    getTableauViewData(TABLEAU_VIEWS.dailySnapshot),
-    getTableauViewData(TABLEAU_VIEWS.adcAlos),
-    getTableauViewData(TABLEAU_VIEWS.rnMetrics),
-    getTableauViewData(TABLEAU_VIEWS.weeklyFrequency),
-    getTableauViewData(TABLEAU_VIEWS.monthlyFrequency),
-    getTableauViewData(TABLEAU_VIEWS.workerTurnover),
+  const [census, adcAlos, rnMetrics, weeklyFreq, monthlyFreq, workerTurnover] = await Promise.all([
+    getTableauViewData(TABLEAU_VIEWS.dailySnapshot),    // cols: "Patient Count"
+    getTableauViewData(TABLEAU_VIEWS.adcAlos),          // cols: "Month of Date","Average Daily Census","Branch Group"
+    getTableauViewData(TABLEAU_VIEWS.rnMetrics),        // cols: "Week of Visit Start Date","Branch Code","Avg. count to completed"
+    getTableauViewData(TABLEAU_VIEWS.weeklyFrequency),  // large — patient-level weekly freq data
+    getTableauViewData(TABLEAU_VIEWS.monthlyFrequency), // cols: "Branch Code","Discipline Code","Month of Visit Start Date","Patient","Year of Visit Start Date","Planned Frequency"
+    getTableauViewData(TABLEAU_VIEWS.workerTurnover),   // cols: "Month of Period End Date","Turnover %","New Hires","Terminations","Worker Count - End","Worker Count - Start"
   ]);
+
+  // ── PROCESS MONTHLY FREQUENCY by Discipline Code ──────────────────
+  // Discipline codes: MA=CNA/Aide, CH=Chaplain, MSW=Social Work, MU=Music, RN=Nursing, LVN=LVN
+  const monthlyRows = monthlyFreq || [];
+  const currentMonth = new Date().toLocaleString('default', { month: 'long' }); // e.g. "March"
+
+  function avgFreqByDisc(rows, discCode, month) {
+    const matching = rows.filter(r =>
+      r['Discipline Code'] === discCode &&
+      (r['Month of Visit Start Date'] || '').includes(month)
+    );
+    if (!matching.length) return { avg: null, count: 0, patients: 0 };
+    const freqs = matching.map(r => parseFloat(r['Planned Frequency'])).filter(v => !isNaN(v) && v > 0 && v < 50);
+    if (!freqs.length) return { avg: null, count: matching.length, patients: matching.length };
+    return {
+      avg: freqs.reduce((a, b) => a + b, 0) / freqs.length,
+      count: freqs.length,
+      patients: matching.length,
+    };
+  }
+
+  // ── PROCESS RN METRICS ───────────────────────────────────────────
+  const rnRows = rnMetrics || [];
+  const latestRNRows = rnRows.slice(-4); // last 4 weeks
+  const rnAvgCompletion = latestRNRows.length
+    ? latestRNRows.reduce((s, r) => s + (parseFloat(r['Avg. count to completed']) || 0), 0) / latestRNRows.length
+    : null;
+
+  // ── BUILD DISCIPLINE SUMMARY ─────────────────────────────────────
+  const disciplines = {
+    cna:      { ...avgFreqByDisc(monthlyRows, 'MA', currentMonth),  targetWeekly: 5,   targetMonthly: null, label: 'CNA (Aide)',     code: 'MA'  },
+    rn:       { avg: rnAvgCompletion ? (rnAvgCompletion * 2) : null, count: latestRNRows.length, patients: null, targetWeekly: 2, targetMonthly: null, label: 'RN (Nursing)', code: 'RN', completionRate: rnAvgCompletion },
+    sw:       { ...avgFreqByDisc(monthlyRows, 'MSW', currentMonth), targetWeekly: null, targetMonthly: 2,  label: 'Social Work',   code: 'MSW' },
+    chaplain: { ...avgFreqByDisc(monthlyRows, 'CH', currentMonth),  targetWeekly: null, targetMonthly: 2,  label: 'Chaplain',      code: 'CH'  },
+  };
+
+  // ── ADC TREND ──────────────────────────────────────────────────
+  const adcRows = adcAlos || [];
+  const latestADC = adcRows.length ? parseFloat((adcRows[adcRows.length - 1]['Average Daily Census'] || '').replace(/,/g, '')) : null;
 
   return {
     census: census || [],
-    admitsDischarges: admitsDC || [],
-    visits: visits || [],
-    visitPatterns: visitPatterns || [],
-    monthlyFrequency: monthlyFreq || [],
+    admitsDischarges: adcRows,        // monthly ADC trend
+    visits: rnRows,                   // RN weekly metrics
+    visitPatterns: weeklyFreq || [],  // weekly freq (large)
+    monthlyFrequency: monthlyRows,    // patient-level monthly planned freq
     workerTurnover: workerTurnover || [],
+    disciplines,                       // ← processed summary sent to frontend
+    currentCensus: (census || []).reduce((s, r) => {
+      const v = parseFloat((r['Patient Count'] || '').replace(/,/g, ''));
+      return s + (isNaN(v) ? 0 : v);
+    }, 0),
+    latestADC,
+    rnCompletionRate: rnAvgCompletion,
   };
 }
 
@@ -419,28 +465,36 @@ async function generateIntelligence(tableau, zendesk, email) {
           content: `Analyze this Moments Hospice operational data and generate risk alerts:
 
 TABLEAU DATA:
-- Census rows: ${tableau.census?.length || 0} branches with data
-- Admits/Discharges data: ${JSON.stringify(tableau.admitsDischarges?.slice(0, 5))}
-- Visit data: ${JSON.stringify(tableau.visits?.slice(0, 5))}
-- Visit patterns: ${JSON.stringify(tableau.visitPatterns?.slice(0, 3))}
+- Current Census: ${tableau.currentCensus || 0} patients on service
+- Current ADC: ${tableau.latestADC || 0}
+- ADC Trend: ${(tableau.admitsDischarges || []).slice(-3).map(r => `${r['Month of Date']||r['Month Tooltip']||''}: ${r['Average Daily Census']||''}`).join(' → ')}
+
+VISIT FREQUENCY (this month):
+- CNA/Aide (MA): avg planned ${tableau.disciplines?.cna?.avg?.toFixed(1) || '?'} visits/month across ${tableau.disciplines?.cna?.patients || 0} patients (target: 5/wk = ~20/mo)
+- RN Completion Rate: ${tableau.disciplines?.rn?.completionRate ? (tableau.disciplines.rn.completionRate * 100).toFixed(1) + '%' : '?'} of scheduled visits completed
+- Social Work (MSW): avg planned ${tableau.disciplines?.sw?.avg?.toFixed(1) || '?'} visits/month (target: 2/month)
+- Chaplain (CH): avg planned ${tableau.disciplines?.chaplain?.avg?.toFixed(1) || '?'} visits/month (target: 2/month)
+
+WORKFORCE (rolling 12-month):
+- Current workforce: ${(tableau.workerTurnover || []).slice(-1)[0]?.['Worker Count - End'] || 'unknown'} workers
+- Turnover rate: ${(tableau.workerTurnover || []).slice(-1)[0]?.['Turnover %'] || 'unknown'} (target <25%)
+- New hires: ${(tableau.workerTurnover || []).slice(-1)[0]?.['New Hires'] || 'unknown'}
+- Terminations: ${(tableau.workerTurnover || []).slice(-1)[0]?.['Terminations'] || 'unknown'}
 
 ZENDESK:
 - Open tickets: ${zendesk.openCount || 0}
 - Overdue (>48h): ${zendesk.overdueCount || 0}
 - Escalated: ${zendesk.escalatedCount || 0}
-- Clinical/safety tickets: ${zendesk.clinicalCount || 0}
-- Bouncing tickets (>72h unresolved): ${zendesk.bouncingCount || 0}
+- Clinical/safety: ${zendesk.clinicalCount || 0}
+- Bouncing (>72h): ${zendesk.bouncingCount || 0}
 - Top issues: ${JSON.stringify(zendesk.topIssues || [])}
-- Critical tickets: ${JSON.stringify(zendesk.criticalTickets || [])}
-- Detected keywords: ${JSON.stringify(zendesk.detectedKeywords || [])}
 
 EMAIL (last 7 days):
-- Resignations detected: ${email.resignationCount || 0}
-${(email.resignations || []).map(r => `  - ${r.from} (${r.branch}): "${r.subject}"`).join('\n')}
-- Complaints: ${email.complaintCount || 0}
+- Resignations: ${email.resignationCount || 0}
 - Staffing alerts: ${email.staffingAlertCount || 0}
+- Complaints: ${email.complaintCount || 0}
 
-Generate specific, actionable risk alerts. Flag visit frequency gaps (target CNA 5x/wk, RN 2x/wk, SW/Chaplain 2x/month), patient safety issues, staffing crises, and Zendesk escalations.`
+Generate specific, actionable risk alerts. Flag: visit frequency gaps vs targets, RN completion rate below 90%, turnover acceleration, Zendesk clinical safety tickets, resignation spikes.`
         }]
       },
       { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } }

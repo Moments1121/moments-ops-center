@@ -1,944 +1,752 @@
-/**
- * Moments Hospice — Zendesk Keyword Intelligence Scanner
- * GitHub: github.com/Moments1121/moments-ops-center
- *
- * Scans Subject, Tags, Description (body), Message Details, and Dialpad AI fields.
- * Filters to open/pending/new/hold ONLY (closed & solved excluded).
- * Detects repeat callers by phone number AND repeat issues by patient/subject.
- * Live data via Anthropic API + CData MCP; falls back to demo snapshot.
- */
+require('dotenv').config();
+const express = require('express');
+const WebSocket = require('ws');
+const cron = require('node-cron');
+const axios = require('axios');
+const cors = require('cors');
+const http = require('http');
+const path = require('path');
 
-import { useState, useEffect, useCallback } from "react";
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// ─────────────────────────────────────────────────────────────────────────────
-// KEYWORD RULES  (subject + tags + body all scanned)
-// Built from real ticket bodies pulled March 10 2026
-// ─────────────────────────────────────────────────────────────────────────────
-export const KEYWORD_RULES = [
-  // ── SAFETY / QI ─────────────────────────────────────────────────────────
-  {
-    category: "Safety — Fall",
-    severity: "critical",
-    color: "#FF3B3B",
-    bg: "#2A0808",
-    icon: "⚠️",
-    bodyKeys: ["fall with injury", "fall report", "a fall report was entered", "patient has had", "fallen"],
-    patterns: [/\bfall\b/i, /\bfallen\b/i, /fall with injury/i, /fall report/i],
-    tag: "occurrence_clarification",
-    clinical_action: "Physician orders, family update, care plan revision, ICC tracking",
-  },
-  {
-    category: "Safety — Seizure/Emergency",
-    severity: "critical",
-    color: "#FF3B3B",
-    bg: "#2A0808",
-    icon: "🚨",
-    bodyKeys: ["seizure", "911", "called 911", "emergency", "unresponsive", "seizure like activity"],
-    patterns: [/seizure/i, /called 911/i, /911 before calling/i, /unresponsive/i],
-    tag: "occurrence_clarification",
-    clinical_action: "Immediate RN assessment, physician notification, family update",
-  },
-  {
-    category: "Safety — Infection",
-    severity: "critical",
-    color: "#FF3B3B",
-    bg: "#2A0808",
-    icon: "🦠",
-    bodyKeys: ["infection report", "wound", "sepsis", "pressure ulcer", "pressure injury", "skin concern"],
-    patterns: [/infection report/i, /\bwound\b/i, /sepsis/i, /pressure ulcer/i, /skin concern/i],
-    tag: "infection_report_clarification",
-    clinical_action: "Wound care orders, HOPE documentation, care plan update",
-  },
-  {
-    category: "Safety — Patient Injured",
-    severity: "critical",
-    color: "#FF3B3B",
-    bg: "#2A0808",
-    icon: "🩹",
-    bodyKeys: ["was patient injured", "injury", "fall with injury", "not safe"],
-    patterns: [/patient injured/i, /fall with injury/i, /not safe/i],
-    tag: "occurrence_clarification",
-    clinical_action: "Occurrence report, physician orders for injury",
-  },
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-  // ── VISIT COMPLIANCE ─────────────────────────────────────────────────────
-  {
-    category: "Late / Unverified Visit",
-    severity: "critical",
-    color: "#FF6B2B",
-    bg: "#2A1008",
-    icon: "⏰",
-    bodyKeys: ["late visits", "unverified", "floating around the system", "not on your device", "late/incomplete", "please address asap", "holding up billing"],
-    patterns: [/late visit/i, /unverified visit/i, /floating.*system/i, /not on your device/i, /please address asap/i, /holding up billing/i, /late.*incomplete/i],
-    tag: "_unverified_visit_request",
-    clinical_action: "Complete documentation or notify TC to add back to device",
-  },
-  {
-    category: "Declined Visit",
-    severity: "high",
-    color: "#FF8C3B",
-    bg: "#251508",
-    icon: "🚫",
-    bodyKeys: ["declined visit", "visit declined", "sent back a declined"],
-    patterns: [/declined visit/i, /sent back a declined/i, /visit.*declined/i],
-    tag: "_declined_visit",
-    clinical_action: "Reassign visit, document reason, follow proper process",
-  },
-  {
-    category: "HUV — Documentation Needed",
-    severity: "high",
-    color: "#FF8C3B",
-    bg: "#251508",
-    icon: "📋",
-    bodyKeys: ["huv", "hope manual", "medication start dates", "addendum", "symptom scoring", "hope scoring", "skin concerns", "in an addendum please add"],
-    patterns: [/\bhuv\b/i, /hope manual/i, /addendum.*correct/i, /symptom.*scoring/i, /skin concern/i, /hope scoring/i],
-    tag: "huv_follow_up",
-    clinical_action: "Place addendum with correct dates, symptom scoring, wound details",
-  },
-  {
-    category: "Reschedule / Reassign Visit",
-    severity: "medium",
-    color: "#FFB830",
-    bg: "#221A00",
-    icon: "🔄",
-    bodyKeys: ["reschedule", "reassign", "move pt", "please move", "coverage needed", "on pto"],
-    patterns: [/reschedul/i, /reassign/i, /please move.*device/i, /coverage.*pts/i],
-    tag: "reschedule_visit",
-    clinical_action: "Manager approval required for reschedule, assign coverage",
-  },
+// ============================================================
+// STATE — latest fetched data stored in memory
+// ============================================================
+let latestData = null;
+let lastFetched = null;
+let isFetching = false;
 
-  // ── MEDICATIONS / ORDERS ─────────────────────────────────────────────────
-  {
-    category: "Unsigned Orders / CTI / POC",
-    severity: "critical",
-    color: "#FF3B3B",
-    bg: "#2A0808",
-    icon: "📝",
-    bodyKeys: ["unsigned cti", "unsigned poc", "bill hold", "holding up billing", "orders needed", "unsigned", "cti and poc", "recert order", "unsigned ctis and pocs"],
-    patterns: [/unsigned cti/i, /unsigned poc/i, /bill.?hold/i, /orders needed.*asap/i, /cti and poc/i, /recert order/i],
-    tag: "order_tracking",
-    clinical_action: "Sign CTI/POC immediately — billing blocked until complete",
-  },
-  {
-    category: "Medication Issue",
-    severity: "high",
-    color: "#E05CFF",
-    bg: "#1A0825",
-    icon: "💊",
-    bodyKeys: ["medication clarification", "medication refill", "running low", "out of medication", "medication management", "prior authorization", "medication question", "script", "declined meds", "declined orders"],
-    patterns: [/medicat/i, /running low/i, /out of.*med/i, /prior auth/i, /\bscript\b/i, /declined.*orders/i, /pharmacy.*calling/i],
-    tag: "declined_meds",
-    clinical_action: "RN to call pharmacy, place orders, confirm with MD",
-  },
-  {
-    category: "Allergy / Medication Update",
-    severity: "medium",
-    color: "#C084FC",
-    bg: "#160820",
-    icon: "⚗️",
-    bodyKeys: ["add an allergy", "allergy", "lorazepam", "allergy please"],
-    patterns: [/allerg/i, /add.*allergy/i],
-    tag: "order_tracking",
-    clinical_action: "Update allergy record in HCHB",
-  },
+// ============================================================
+// WEBSOCKET — push updates to all connected clients
+// ============================================================
+function broadcast(data) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(data));
+    }
+  });
+}
 
-  // ── DME ──────────────────────────────────────────────────────────────────
-  {
-    category: "DME — Urgent / Not Ordered",
-    severity: "critical",
-    color: "#FF6B2B",
-    bg: "#2A1008",
-    icon: "🛏️",
-    bodyKeys: ["dme not ordered", "lost dme", "cannot locate", "dme need", "dme reason", "hospital bed", "bariatric", "wheelchair", "oxygen tank", "shower chair", "electric lift recliner", "broda scoot"],
-    patterns: [/lost dme/i, /cannot locate/i, /dme.*need/i, /dme.*reason/i, /bariatric.*bed/i, /oxygen tank/i, /broda scoot/i],
-    tag: "dme_not_ordered",
-    clinical_action: "Order DME immediately, confirm delivery ETA with patient/family",
-  },
-  {
-    category: "DME — Pickup / Return",
-    severity: "medium",
-    color: "#FF8C3B",
-    bg: "#251508",
-    icon: "📦",
-    bodyKeys: ["dme pick up", "dme pickup", "picking up", "remove the", "expired last night", "family purchased"],
-    patterns: [/dme.*pick.?up/i, /picking up.*dme/i, /remove the.*chair/i, /expired.*dme/i],
-    tag: "dme_orderpickup",
-    clinical_action: "Coordinate pickup with DME company",
-  },
+wss.on('connection', (ws) => {
+  console.log('Client connected');
+  // Send latest data immediately on connect
+  if (latestData) {
+    ws.send(JSON.stringify({ type: 'data', payload: latestData, lastFetched }));
+  } else {
+    ws.send(JSON.stringify({ type: 'loading' }));
+  }
+});
 
-  // ── CLINICAL QUALITY ─────────────────────────────────────────────────────
-  {
-    category: "Comfort Cares / Active Dying",
-    severity: "critical",
-    color: "#FF3B3B",
-    bg: "#2A0808",
-    icon: "🕊️",
-    bodyKeys: ["comfort cares", "comfort measures", "on comfort cares", "actively dying"],
-    patterns: [/comfort care/i, /actively dying/i, /comfort measure/i],
-    tag: "patient_care",
-    clinical_action: "Ensure RN visit scheduled, family notified, MD updated",
-  },
-  {
-    category: "Death / Bereavement",
-    severity: "high",
-    color: "#888888",
-    bg: "#111111",
-    icon: "🕯️",
-    bodyKeys: ["expired last night", "death report", "death visit", "death certification", "passed", "funeral home", "cremation", "final arrangements"],
-    patterns: [/\bdeath\b/i, /expired.*night/i, /death report/i, /funeral home/i, /final arrangements/i, /cremation/i],
-    tag: "death",
-    clinical_action: "Death certification, DME pickup, bereavement follow-up",
-  },
-  {
-    category: "Complaint",
-    severity: "high",
-    color: "#FF3B3B",
-    bg: "#2A0808",
-    icon: "📣",
-    bodyKeys: ["complaint", "requesting call back regarding", "facility called"],
-    patterns: [/\bcomplaint\b/i, /facility complaint/i, /requesting call back regarding/i],
-    tag: "complaint",
-    clinical_action: "Document complaint, escalate to clinical manager",
-  },
+// ============================================================
+// TABLEAU API
+// ============================================================
+let tableauAuthToken = null;
+let tableauTokenExpiry = null;
+let tableauSiteLuid = null; // The real UUID Tableau needs for API calls
 
-  // ── INTAKE / ADMISSIONS ──────────────────────────────────────────────────
-  {
-    category: "New Referral",
-    severity: "info",
-    color: "#00D4AA",
-    bg: "#001A14",
-    icon: "🆕",
-    bodyKeys: ["referral", "new referral", "dx end stage", "discharge pending placement", "consult", "family wants consult", "referral source"],
-    patterns: [/\breferral\b/i, /new referral/i, /dx.*end stage/i, /discharge.*placement/i, /family wants consult/i],
-    tag: "referral_intake",
-    clinical_action: "HCC follow-up, schedule informational visit",
-  },
-  {
-    category: "Pre-Registration / Admit",
-    severity: "medium",
-    color: "#3BAAFF",
-    bg: "#081525",
-    icon: "📄",
-    bodyKeys: ["pre-reg", "preregistration", "prereg", "patient is admitted", "please add nurse as assignee", "enter team members", "care team members needed"],
-    patterns: [/pre.?reg/i, /patient is admitted/i, /enter team members/i, /care team.*needed/i],
-    tag: "pre-registration",
-    clinical_action: "Upload to HCHB, assign RN case manager, enter team members",
-  },
-  {
-    category: "F2F Required",
-    severity: "high",
-    color: "#FFB830",
-    bg: "#221A00",
-    icon: "👥",
-    bodyKeys: ["f2f required", "f2f needed", "add on f2f", "schedule a ftf", "face-to-face"],
-    patterns: [/f2f required/i, /f2f needed/i, /\bf2f\b/i, /face.to.face/i, /schedule a ftf/i],
-    tag: "order_tracking",
-    clinical_action: "Schedule F2F visit, confirm in HCHB",
-  },
+async function getTableauToken() {
+  if (tableauAuthToken && tableauTokenExpiry && Date.now() < tableauTokenExpiry) {
+    return tableauAuthToken;
+  }
+  try {
+    const res = await axios.post(
+      `${process.env.TABLEAU_SERVER}/api/3.21/auth/signin`,
+      {
+        credentials: {
+          personalAccessTokenName: process.env.TABLEAU_TOKEN_NAME,
+          personalAccessTokenSecret: process.env.TABLEAU_TOKEN_VALUE,
+          site: { contentUrl: process.env.TABLEAU_SITE_ID }
+        }
+      }
+    );
+    tableauAuthToken = res.data.credentials.token;
+    // Capture the site LUID (UUID) — this is what the REST API actually needs
+    tableauSiteLuid = res.data.credentials.site.id;
+    tableauTokenExpiry = Date.now() + 200 * 60 * 1000;
+    console.log('✅ Tableau auth token refreshed, site LUID:', tableauSiteLuid);
+    return tableauAuthToken;
+  } catch (err) {
+    console.error('❌ Tableau auth failed:', err.message);
+    return null;
+  }
+}
 
-  // ── BILLING / RECORDS ────────────────────────────────────────────────────
-  {
-    category: "Billing Issue",
-    severity: "medium",
-    color: "#FFB830",
-    bg: "#221A00",
-    icon: "💰",
-    bodyKeys: ["bill hold", "holding up billing", "billing", "unpaid", "remittance", "claim status", "payment"],
-    patterns: [/bill.?hold/i, /holding up billing/i, /\bbilling\b/i, /unpaid.*bill/i, /claim status/i],
-    tag: "billing",
-    clinical_action: "Clear bill hold, sign outstanding orders",
-  },
-  {
-    category: "Medical Records Request",
-    severity: "low",
-    color: "#3BAAFF",
-    bg: "#081525",
-    icon: "📁",
-    bodyKeys: ["request to update records", "update records", "funeral home", "medical record", "polst"],
-    patterns: [/update.*records/i, /medical record/i, /\bpolst\b/i],
-    tag: "medical_records",
-    clinical_action: "Process within 24 hours",
-  },
+async function getTableauViewData(viewId) {
+  const token = await getTableauToken();
+  if (!token || !tableauSiteLuid) return null;
+  try {
+    const res = await axios.get(
+      `${process.env.TABLEAU_SERVER}/api/3.21/sites/${tableauSiteLuid}/views/${viewId}/data`,
+      {
+        headers: { 'X-Tableau-Auth': token },
+        params: { maxAge: 5 } // allow up to 5 min cached extract
+      }
+    );
+    return parseCSV(res.data);
+  } catch (err) {
+    console.error(`❌ Tableau view ${viewId} failed:`, err.message);
+    return null;
+  }
+}
 
-  // ── CALLBACK / PHONE ─────────────────────────────────────────────────────
-  {
-    category: "Call Back Request",
-    severity: "medium",
-    color: "#3BAAFF",
-    bg: "#081525",
-    icon: "📞",
-    bodyKeys: ["call back", "requesting call back", "please call back", "call back asap", "return call", "call me back", "callback"],
-    patterns: [/call.?back.*asap/i, /requesting.*call.?back/i, /please call.*back/i, /return call/i],
-    tag: "call_back",
-    clinical_action: "Return call within 30 minutes",
-  },
-  {
-    category: "Nurse Visit Request",
-    severity: "high",
-    color: "#FF8C3B",
-    bg: "#251508",
-    icon: "🏥",
-    bodyKeys: ["nurse request", "call for the nurse", "rn requested", "rn88", "visit request", "call transferred to rn", "requesting to speak to a nurse", "requesting nurse visit"],
-    patterns: [/nurse request/i, /call for the nurse/i, /transferred to.*rn/i, /speak.*nurse/i, /requesting nurse/i, /\brn88\b/i],
-    tag: "patient_care",
-    clinical_action: "Transfer to RN case manager, document in HCHB",
-  },
+function parseCSV(csv) {
+  if (!csv) return [];
+  const lines = csv.trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+  return lines.slice(1).map(line => {
+    const values = line.match(/(".*?"|[^,]+)(?=,|$)/g) || [];
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = (values[i] || '').replace(/"/g, '').trim();
+    });
+    return obj;
+  });
+}
 
-  // ── HR / IT ──────────────────────────────────────────────────────────────
-  {
-    category: "New Hire / Onboarding",
-    severity: "info",
-    color: "#00D4AA",
-    bg: "#001A14",
-    icon: "👤",
-    bodyKeys: ["new hire", "onboard", "offboard", "no show offboard", "termination", "resignation"],
-    patterns: [/new hire/i, /onboard/i, /offboard/i, /termination/i, /resignation/i],
-    tag: "new_hire_request",
-    clinical_action: "Process in Workbright, set up HCHB access",
-  },
-  {
-    category: "IT Issue",
-    severity: "low",
-    color: "#2A4A5A",
-    bg: "#08141A",
-    icon: "💻",
-    bodyKeys: ["contacts not syncing", "pointcare", "voice to text", "nvoq", "tablet", "software", "not syncing", "fleet car"],
-    patterns: [/not syncing/i, /pointcare/i, /voice to text/i, /\bnvoq\b/i, /fleet car/i],
-    tag: "helpdesk",
-    clinical_action: "Submit IT helpdesk ticket",
-  },
-
-  // ── AUTO-GENERATED (low noise) ────────────────────────────────────────────
-  {
-    category: "Fax / Auto-Email",
-    severity: "low",
-    color: "#1A3A4A",
-    bg: "#06101A",
-    icon: "📠",
-    bodyKeys: ["new fax message", "fax message", "ringcentral", "warning: this email originated"],
-    patterns: [/new fax message/i, /ringcentral/i, /warning.*outside.*organization/i],
-    tag: "efax",
-    clinical_action: "Route to appropriate team",
-  },
-  {
-    category: "Dialpad Call",
-    severity: "low",
-    color: "#1A3A4A",
-    bg: "#06101A",
-    icon: "📱",
-    bodyKeys: ["dialpad call with", "direction: inbound", "direction: outbound", "active call"],
-    patterns: [/dialpad call with/i, /direction: inbound/i, /direction: outbound/i],
-    tag: "dialpad_call",
-    clinical_action: "Review Dialpad AI recap for action items",
-  },
-];
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BRANCH MAP
-// ─────────────────────────────────────────────────────────────────────────────
-const BRANCH = {
-  eau_claire: "Eau Claire", duluth: "Duluth",
-  "firekeepers_-_wi": "GRB Firekeepers", firekeepers___wi: "GRB Firekeepers",
-  "lightkeepers_-_wi": "GRB Light", lightkeepers___wi: "GRB Light",
-  "mountain_movers_-_wi": "GRB Mountain", mountain_movers___wi: "GRB Mountain",
-  milwaukee: "Milwaukee", sheboygan__wi: "Sheboygan", rochester: "Rochester",
-  miami_fl_leon: "MIA Leon N", miami_fl_leon_south: "MIA Leon S",
-  chicago_s: "Chicago S", springfield_il: "Springfield IL",
-  la_crosse: "La Crosse", stevens_point: "Stevens Point",
-  hiawatha__ia: "Hiawatha IA", hudson: "Hudson WI",
-  st_cloud_mn_blue_team: "St Cloud Blue", st_cloud: "St Cloud",
-  golden_valley: "Golden Valley", golden_valley_mn_purple: "GV Purple",
-  madison: "Madison", mankato: "Mankato", brainerd: "Brainerd",
-  rhinelander_wi: "Rhinelander", alexandria: "Alexandria",
-  fort_wayne__in: "Fort Wayne IN",
+// Your actual Tableau View IDs from Moments Hospice site
+const TABLEAU_VIEWS = {
+  keyMetricsSummary:    '19bb88d6-87df-4777-a793-e5b075c51390',
+  keyMetricsCensus:     '83d74db5-a7dd-4069-9b87-eb07eca1a6b7', // Default project - no permission issue
+  keyMetricsAdmitsDC:   'a7f03568-243c-49a7-936c-12d72f4cda22', // Default project
+  keyMetricsVisits:     '36e87a3f-380e-4cb3-af55-408dd0cbdc3e', // Default project
+  keyMetricsGrossMargin:'ea12fe7f-f607-4fca-a273-2e478b07119f',
+  keyMetricsCostPerDay: '4323de7a-ab69-4fa8-b02a-3af0316e0b2c',
+  visitPatterns:        '7fa1a9e7-04e5-4926-acf1-36852cd91db7', // Visits - Counts (Scheduling)
+  visitsMissed:         'a6260fca-9f9c-411f-a727-90f91ab115d9', // Visits - Missed
+  hospiceCensus:        '0d1e5ad7-b894-45c0-94dc-a15a2ed5c1c7',
+  workerTurnover:       '90b95c03-aed5-48ad-9f7d-79715fe6eb1c',
+  fieldMetrics:         'a3b94d0b-167a-4901-9c8c-a04bd13917de',
+  visitUtilization:     '76559abf-47a8-475e-9d96-eecb35e20d2a',
 };
 
-function getBranch(tags = "") {
-  for (const part of tags.split(",")) {
-    const k = part.trim();
-    if (BRANCH[k]) return BRANCH[k];
-  }
-  return null;
+async function fetchTableauData() {
+  console.log('📊 Fetching Tableau data...');
+  const [census, admitsDC, visits, visitPatterns, visitsMissed, workerTurnover] = await Promise.all([
+    getTableauViewData(TABLEAU_VIEWS.keyMetricsCensus),
+    getTableauViewData(TABLEAU_VIEWS.keyMetricsAdmitsDC),
+    getTableauViewData(TABLEAU_VIEWS.keyMetricsVisits),
+    getTableauViewData(TABLEAU_VIEWS.visitPatterns),
+    getTableauViewData(TABLEAU_VIEWS.visitsMissed),
+    getTableauViewData(TABLEAU_VIEWS.workerTurnover),
+  ]);
+
+  return {
+    census: census || [],
+    admitsDischarges: admitsDC || [],
+    visits: visits || [],
+    visitPatterns: visitPatterns || [],
+    visitsMissed: visitsMissed || [],
+    workerTurnover: workerTurnover || [],
+  };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CLASSIFY — scans ALL text fields
-// ─────────────────────────────────────────────────────────────────────────────
-function classifyTicket(t) {
-  const fullText = [
-    t.Subject, t.Tags, t.Description, t["Message Details"],
-    t["Dialpad Ai Recap"], t["Dialpad Ai Call Purpose"], t["Dialpad Ai Action Items"],
-    t["On Call - Action's Taken"], t["Was Patient Injured?"],
-  ].filter(Boolean).join(" ");
-
-  const matches = [];
-  for (const rule of KEYWORD_RULES) {
-    if (rule.patterns.some((p) => p.test(fullText))) {
-      matches.push(rule);
-    }
-  }
-  return matches;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// NAME EXTRACTION from subject (multiple formats)
-// ─────────────────────────────────────────────────────────────────────────────
-function extractName(subject = "") {
-  if (!subject) return null;
-  const s = subject.trim();
-
-  // "D. Perry // call back // EAU"
-  const m1 = s.match(/^([A-Z][a-z]?\.\s+[A-Z][a-zA-Z\-']+(?:\s+[A-Z][a-zA-Z\-']+)?)\s*\/\//);
-  if (m1) return m1[1].trim();
-
-  // "FIREKPRS- M. STADLER- FALL"
-  const m2 = s.match(/^[A-Z]{2,8}[-\s]+([A-Z][a-z]?\.\s+[A-Z][A-Z\-']+)\s*-/);
-  if (m2) return m2[1].trim();
-
-  // "EAU Harold Olson HUV"
-  const m3 = s.match(/^[A-Z]{2,4}\s+([A-Z][a-z]+\s+[A-Z][a-z]+)/);
-  if (m3) return m3[1].trim();
-
-  // "BETTY J LANGE // firekeepers"
-  const m4 = s.match(/^([A-Z][A-Z\s]+[A-Z])\s*\/\//);
-  if (m4 && m4[1].trim().split(" ").length >= 2) return m4[1].trim();
-
-  // "GRB Craig Patterson HUV"
-  const m5 = s.match(/^[A-Z]{2,4}\s+([A-Z][a-z]+\s+[A-Z][a-z]+)\s+(HUV|FALL|DME)/i);
-  if (m5) return m5[1].trim();
-
-  return null;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// DEMO DATA (real tickets from March 10 2026, status: open/pending/new/hold)
-// ─────────────────────────────────────────────────────────────────────────────
-const DEMO_TICKETS = [
-  { Id: 776433, Subject: "Unverified Visits - Please address!", Tags: "daily_audit_for_unverified_visit,sheboygan__wi,no_response_start", Status: "pending", Description: "The visits below are unverified. NOT ON YOUR DEVICE but are floating around the system. Please address: complete documentation, complete as missed visit, or have leadership void.", CreatedAt: "2026-03-10T17:06:51Z", "Dialpad - Called from": null },
-  { Id: 776428, Subject: "ATW Marietta Noceda HUV", Tags: "firekeepers_-_wi,huv_follow_up,qa_bump_start", Status: "pending", Description: "We reviewed the HUV visit for this patient and need clarification. Skin: you marked no for skin concerns however per ICC charting there is/are skin concerns. In an addendum please add in the current wounds and all treatments.", CreatedAt: "2026-03-10T17:01:01Z", "Dialpad - Called from": null },
-  { Id: 776431, Subject: "K.P. oxygen tanks", Tags: "appleton,central_support,dme", Status: "new", Description: "I need 6 large oxygen tanks delivered for Kay Petersen at Silverstone assisted living. Room 27.", CreatedAt: "2026-03-10T17:06:22Z", "Dialpad - Called from": null },
-  { Id: 776413, Subject: "Mittie Davidson", Tags: "chicago_s,dme,dme_orderpickup", Status: "hold", Description: "Can you follow up with integra about picking up Mittie Davidson's DME she expired last night and facility is looking for the dme to be picked up asap.", "Message Details": "Patient expired last night. Facility needs DME picked up asap.", CreatedAt: "2026-03-10T16:52:16Z", "Dialpad - Called from": null },
-  { Id: 776427, Subject: "Move pt", Tags: "brainerd,scheduling,move", Status: "new", Description: "Please move Arnold Johnson to my device from tomorrow to today.", CreatedAt: "2026-03-10T17:00:50Z", "Dialpad - Called from": null },
-  { Id: 776404, Subject: "M.S. broda scoot", Tags: "appleton,dme,firekeepers_-_wi", Status: "hold", Description: "Can I order a broda scoot for Marilyn Stadler at Silverstone assisted living for increased weakness. Room #19.", "Message Details": "Order a broda scoot for Marilyn Stadler, increased weakness.", CreatedAt: "2026-03-10T16:48:07Z", "Dialpad - Called from": null },
-  { Id: 776403, Subject: "BETTY J LANGE // firekeepers_-_wi -- Enter Team Members", Tags: "firekeepers_-_wi,team_members_update,no_response_start", Status: "pending", Description: "Patient is admitted. Work with the local teams to enter in full team member list into HCHB case manager section.", CreatedAt: "2026-03-10T16:47:36Z", "Dialpad - Called from": null },
-  { Id: 776402, Subject: "reschedule", Tags: "reschedule_visit,sheboygan__wi", Status: "pending", Description: "I received your request to reschedule visit for Pt sheila reimer from 3/10 to 3/18. Please provide an explanation for the reschedule, or manager approval before sending back to scheduling.", CreatedAt: "2026-03-10T16:47:07Z", "Dialpad - Called from": null },
-  { Id: 776401, Subject: "DOYLE WILLIAMS CALL BACK", Tags: "golden_valley", Status: "open", Description: "FACILITY CHARLES 763-971-6300 REQUESTING CALL BACK REGARDING DOYLE WILLIAMS", CreatedAt: "2026-03-10T16:46:09Z", "Dialpad - Called from": null },
-  { Id: 776392, Subject: "CAn we add an allergy please", Tags: "central_support,cloud", Status: "new", Description: "Can we add Lorazepam as an allergy to Jerome Theimann please.", CreatedAt: "2026-03-10T16:42:12Z", "Dialpad - Called from": null },
-  { Id: 776387, Subject: "Readmit GRB MOUNTAIN MOVERS **F2F REQUIRED 3RD BP** Marilyn Schaetz", Tags: "mountain_movers_-_wi,referral_intake,intake_cc", Status: "pending", Description: "CALL FROM SW LEXI - patient admitted to hospital. They are hoping to discharge her back to the AL by Friday. Patient still current in HCHB.", CreatedAt: "2026-03-10T16:40:05Z", "Dialpad - Called from": null },
-  { Id: 776384, Subject: "Re: MIA LEON SOUTH/ KENDALL **F2F REQUIRED 8TH BP** JOSE ALVARADO", Tags: "miami_fl_leon,referral_intake,intake_cc", Status: "open", Description: "Received a call from Sonny at West Kendall Baptist hospital stating patient is currently in the ER. Requesting to speak to a nurse. Please call back ASAP 786-467-8710.", CreatedAt: "2026-03-10T16:38:20Z", "Dialpad - Called from": null },
-  { Id: 776381, Subject: "HHA coverage 3/11-3/13", Tags: "brainerd,weekly_schedules", Status: "pending", Description: "Heather is on PTO the rest of the week needing coverage for pts listed above.", CreatedAt: "2026-03-10T16:36:18Z", "Dialpad - Called from": null },
-  { Id: 776380, Subject: "PALLIATIVE CARE//CALL BACK", Tags: "moments_hospice_cc,no_response_start", Status: "open", Description: "PALLIATIVE CARE CALL BACK REQUEST", CreatedAt: "2026-03-10T16:35:45Z", "Dialpad - Called from": null },
-  { Id: 776374, Subject: "Late Visit - Please address ASAP!", Tags: "_unverified_visit_request,eau_claire,no_response_start", Status: "pending", Description: "Hello Penny Hanson, We noticed that you have the following late visits that need to be completed so that our patients receive the care we have committed to.", CreatedAt: "2026-03-10T16:31:11Z", "Dialpad - Called from": null },
-  { Id: 776362, Subject: "Late Visit - Please address ASAP!", Tags: "_unverified_visit_request,eau_claire,no_response_start", Status: "pending", Description: "Hello Tina Adams, We noticed that you have the following late visits that need to be completed.", CreatedAt: "2026-03-10T16:28:01Z", "Dialpad - Called from": null },
-  { Id: 776360, Subject: "Late Visit - Please address ASAP!", Tags: "_unverified_visit_request,duluth,no_response_start", Status: "pending", Description: "Hello Courtney Cuff, We noticed that you have the following late visits that need to be completed.", CreatedAt: "2026-03-10T16:26:32Z", "Dialpad - Called from": null },
-  { Id: 776356, Subject: "Late Visit - Please address ASAP!", Tags: "_unverified_visit_request,duluth,no_response_start", Status: "pending", Description: "Hello Brook Payne, We noticed that you have the following late visits that need to be completed.", CreatedAt: "2026-03-10T16:22:36Z", "Dialpad - Called from": null },
-  { Id: 776366, Subject: "FIREKPRS- M. STADLER- FALL", Tags: "firekeepers_-_wi,occurrence_clarification,qa_bump_end", Status: "open", Description: "Patient: M. STADLER. A fall report was entered. physician orders for injury, ICC tracking, Update MD's (Medical director and PCP), Update Family, New interventions required.", CreatedAt: "2026-03-10T16:28:55Z", "Dialpad - Called from": null },
-  { Id: 776363, Subject: "FIREKPRS- M. STADLER- FALL", Tags: "firekeepers_-_wi,occurrence_clarification,qa_bump_start", Status: "pending", Description: "Please follow up at a branch level with reporting to State agencies as needed, review of charting and updates per moments processes. fall with injury.", CreatedAt: "2026-03-10T16:28:01Z", "Dialpad - Called from": null },
-  { Id: 776188, Subject: "BRD- M. MARTINEZ- FALL", Tags: "brainerd,occurrence_clarification,qa_bump_start", Status: "open", Description: "A fall report was entered. physician orders for injury, ICC tracking. fall with injury. Update MD's, family, new interventions.", CreatedAt: "2026-03-10T15:18:05Z", "Dialpad - Called from": null },
-  { Id: 776349, Subject: "MKE- S. ZEMBRZUSKI- FALL", Tags: "milwaukee,occurrence_clarification,qa_bump_start", Status: "pending", Description: "A fall report was entered. fall with injury. physician orders for injury, ICC tracking, Update MD's, family, new interventions.", CreatedAt: "2026-03-10T16:19:56Z", "Dialpad - Called from": null },
-  { Id: 776348, Subject: "MKE- S. ZEMBRZUSKI- FALL", Tags: "milwaukee,occurrence_clarification,qa_bump_start", Status: "pending", Description: "Please follow up at branch level. fall with injury.", CreatedAt: "2026-03-10T16:19:19Z", "Dialpad - Called from": null },
-  { Id: 776345, Subject: "MKE- K. MACAULAY- FALL", Tags: "milwaukee,occurrence_clarification,qa_bump_start", Status: "pending", Description: "A fall report was entered. Update MD's, family, new interventions.", CreatedAt: "2026-03-10T16:17:41Z", "Dialpad - Called from": null },
-  { Id: 776354, Subject: "HUD- D. OLIVER- FALL", Tags: "hudson,occurrence_clarification,qa_bump_start", Status: "pending", Description: "fall with injury. Please follow up at branch level, report to State agencies.", CreatedAt: "2026-03-10T16:21:45Z", "Dialpad - Called from": null },
-  { Id: 776338, Subject: "BRD- R. CHRISTOPHERS- FALL", Tags: "brainerd,occurrence_clarification,qa_bump_start", Status: "pending", Description: "We reviewed charting and noted there is not a fall coordination note type entered. please fill out this template.", CreatedAt: "2026-03-10T16:15:01Z", "Dialpad - Called from": null },
-  { Id: 776293, Subject: "sbm- s. mcintosh- fall", Tags: "sheboygan__wi,occurrence_clarification,qa_bump_start", Status: "pending", Description: "A fall report was entered. physician orders for injury, ICC tracking, Update MD's, family.", CreatedAt: "2026-03-10T15:58:07Z", "Dialpad - Called from": null },
-  { Id: 776290, Subject: "sbm- s. mcintosh- fall", Tags: "sheboygan__wi,occurrence_clarification,qa_bump_start", Status: "pending", Description: "fall with injury. Please follow up at branch level.", CreatedAt: "2026-03-10T15:56:52Z", "Dialpad - Called from": null },
-  { Id: 776322, Subject: "AXN- D. HAGEL- FALL", Tags: "alexandria,occurrence_clarification,qa_bump_end", Status: "open", Description: "fall with injury. Please follow up at branch level.", CreatedAt: "2026-03-10T16:09:39Z", "Dialpad - Called from": null },
-  { Id: 776318, Subject: "EAU- M. OBRIEN- OTHER QI REPORT", Tags: "eau_claire,occurrence_clarification,qa_bump_start", Status: "pending", Description: "FACILITY CALLED TO STATE PATIENT HAD SEIZURE LIKE ACTIVITY. THEY CALLED 911 BEFORE CALLING HOSPICE. RN VISIT NOTED PATIENT BACK TO BASELINE.", CreatedAt: "2026-03-10T16:08:00Z", "Dialpad - Called from": null },
-  { Id: 776369, Subject: "LOST DME", Tags: "dme,st_cloud_mn_blue_team,dme_not_ordered,no_response_start", Status: "pending", Description: "We had a pick up order for Genevieve Sand at Edenbrook St. Cloud and the staff could not locate a Tilt shower chair. Please assist us in locating this shower chair.", "Message Details": "DME cannot be located. Tilt shower chair missing.", CreatedAt: "2026-03-10T16:30:01Z", "Dialpad - Called from": null },
-  { Id: 776346, Subject: "DME", Tags: "dme,mankato,dme_not_ordered,no_response_start", Status: "pending", Description: "Bruce Howard - DOB 4/25/1950. DME NEED: Bariatric Hospital Bed. DME REASON: Patient's current regular size hospital bed not big enough.", "Message Details": "Bariatric Hospital Bed needed for Bruce Howard.", CreatedAt: "2026-03-10T16:18:57Z", "Dialpad - Called from": null },
-  { Id: 776311, Subject: "dme", Tags: "eau_claire,dme", Status: "pending", Description: "ARBADELLA A NANDORY. Please order: Hospital bed, Tripod lift bar, Bed side table. PLEASE CALL HEIDI with eta.", CreatedAt: "2026-03-10T16:06:51Z", "Dialpad - Called from": null },
-  { Id: 776286, Subject: "J.S", Tags: "firekeepers_-_wi,dme,patient", Status: "pending", Description: "JAMES F STEARLE. Patient would like electric lift recliner.", CreatedAt: "2026-03-10T16:39:59Z", "Dialpad - Called from": null },
-  { Id: 776333, Subject: "Re: Unsigned CTIs and POCs", Tags: "alexandria,order_tracking,no_response_start", Status: "open", Description: "Please see the below CTI and POC bill holds. These are outstanding for a while. Unsigned CTIs and POCs from November, December, January still outstanding. bill hold blocking billing.", CreatedAt: "2026-03-10T16:12:54Z", "Dialpad - Called from": null },
-  { Id: 776316, Subject: "ATW and GRB Unverified Visits- Orders Needed ASAP", Tags: "daily_audit_for_unverified_visit,firekeepers_-_wi,no_response_start", Status: "pending", Description: "The following visits are holding up billing and needs orders to remove.", CreatedAt: "2026-03-10T16:07:26Z", "Dialpad - Called from": null },
-  { Id: 776314, Subject: "GRB Unverified Visits- Orders Needed ASAP", Tags: "daily_audit_for_unverified_visit,lightkeepers_-_wi,no_response_start", Status: "pending", Description: "The following visits are holding up billing and needs orders to remove.", CreatedAt: "2026-03-10T16:07:18Z", "Dialpad - Called from": null },
-  { Id: 776313, Subject: "GRB Unverified Visits- Orders Needed ASAP", Tags: "daily_audit_for_unverified_visit,lightkeepers_-_wi,no_response_start", Status: "pending", Description: "The following visits are holding up billing and needs orders to remove.", CreatedAt: "2026-03-10T16:07:11Z", "Dialpad - Called from": null },
-  { Id: 776151, Subject: "LSE Late/Incomplete Visit", Tags: "la_crosse,daily_audit_for_unverified_visit,no_response_start", Status: "open", Description: "Late/incomplete visit. Needs to be addressed immediately.", CreatedAt: "2026-03-10T14:52:08Z", "Dialpad - Called from": null },
-  { Id: 776153, Subject: "Medication Orders Needing Approval", Tags: "st_cloud,qa,no_response_start", Status: "open", Description: "Medication orders needing approval. Please review and sign.", CreatedAt: "2026-03-10T14:52:14Z", "Dialpad - Called from": null },
-  { Id: 776296, Subject: "RHI Gale Rachuy HUV", Tags: "rhinelander_wi,huv_follow_up,qa_bump_start", Status: "open", Description: "Medication start dates: you indicated start/continue dates are today however not consistent with record review. please place an addendum with the correct order date.", CreatedAt: "2026-03-10T16:00:04Z", "Dialpad - Called from": null },
-  { Id: 776270, Subject: "DLH Gale Rachuy HUV", Tags: "duluth,huv_follow_up,qa_bump_start", Status: "pending", Description: "Medication start dates inconsistent. please place an addendum with correct order date.", CreatedAt: "2026-03-10T15:44:14Z", "Dialpad - Called from": null },
-  { Id: 776364, Subject: "EAU Harold Olson HUV", Tags: "eau_claire,huv_follow_up,qa_bump_end", Status: "open", Description: "Medication start dates incorrect. Symptom scoring missing: Pain, SOB, Anxiety, nausea, constipation, agitation. Please add addendum.", CreatedAt: "2026-03-10T16:28:16Z", "Dialpad - Called from": null },
-  { Id: 776352, Subject: "GRB Craig Patterson HUV", Tags: "firekeepers_-_wi,huv_follow_up,qa_bump_start", Status: "open", Description: "Medication start dates: not consistent with record review. Please place addendum with correct order date.", CreatedAt: "2026-03-10T16:21:10Z", "Dialpad - Called from": null },
-  { Id: 776317, Subject: "Declined Visit", Tags: "_declined_visit,golden_valley,no_response_start", Status: "pending", Description: "You sent back a Declined visit, for Gayle Crow, Audrey Mainquist and Elaine Mueller for today. Who should this visit be assigned to?", CreatedAt: "2026-03-10T16:07:55Z", "Dialpad - Called from": null },
-  { Id: 776405, Subject: "Declined Visit", Tags: "_declined_visit,miami_fl_leon,no_response_start", Status: "pending", Description: "You sent back a Declined visit, for BARBARA ROIG HERNANDEZ on 2026-03-10. Who should this visit be assigned to?", CreatedAt: "2026-03-10T16:48:46Z", "Dialpad - Called from": null },
-  { Id: 776334, Subject: "Dialpad call with Morton Ltc, Transferred / 3 min", Tags: "dialpad_call,firekeepers_-_wi,patient_care,no_response_start", Status: "pending", Description: "Dialpad call with Morton Ltc. Direction: inbound. Phone: +19208862908", "Message Details": "Pharmacy calling for medication clarification please call back asap", "Dialpad Ai Recap": "Shannon receives call from Morton of Martin Pharmacy regarding medication C. Code. Nurse unavailable. Callback number provided.", "Dialpad Ai Call Purpose": "Callback", "Dialpad - Called from": "+19208862908", "Dialpad Ai Action Items": "Shannon to send message to nurse to call Morton back.", CreatedAt: "2026-03-10T16:13:16Z" },
-  { Id: 776415, Subject: "Dialpad call with Jessica Hagman, Outbound / 1 min", Tags: "dialpad_call,patient_care", Status: "open", Description: "Dialpad call outbound. Phone: +17153889245", "Dialpad Ai Recap": "Summaries are currently not generated for short calls.", "Dialpad - Called from": "+17153889245", CreatedAt: "2026-03-10T16:53:10Z" },
-  { Id: 776421, Subject: "Dialpad call with (319) 893-2387, Active call", Tags: "dialpad_call", Status: "open", Description: "Direction: inbound. Phone: +13198932387", "Dialpad - Called from": "+13198932387", CreatedAt: "2026-03-10T16:58:37Z" },
-  { Id: 776416, Subject: "MKM REFERRAL JAMES PETERSON MAYO MANKATO D/C PENDING PLACEMENT", Tags: "mankato,referral_intake,intake_cc", Status: "pending", Description: "Patient is on comfort cares here at the hospital. The Beacon in Mapleton will be assessing today for placement. Family would like Moments to follow.", CreatedAt: "2026-03-10T16:53:43Z", "Dialpad - Called from": null },
-  { Id: 776408, Subject: "MSP PURPLE REFERRAL: MICHAEL SIMON, TERRACE OF CRYSTAL", Tags: "golden_valley_mn_purple,referral_intake,intake_cc", Status: "open", Description: "FAMILY WANTS CONSULT. DX END STAGE PARKINSON'S. Patient: MICHAEL SIMON. SNF: TERRACE OF CRYSTAL. Referral Contact: CHARLES 763-971-6300.", CreatedAt: "2026-03-10T16:50:12Z", "Dialpad - Called from": null },
-  { Id: 776253, Subject: "STE REFERRAL WINIFRED KAISER CAREVIEW TRANSITIONAL", Tags: "referral_intake,stevens_point", Status: "pending", Description: "New referral - Winifred Kaiser. Careview Transitional Care.", CreatedAt: "2026-03-10T15:39:30Z", "Dialpad - Called from": null },
-  { Id: 776435, Subject: "Final arrangements", Tags: "chicago_s,medical_records,patient", Status: "new", Description: "Please add the following arrangements into patient records. MAURO MARTINEZ. Blake Lamb Funeral Home 708-636-1193.", CreatedAt: "2026-03-10T17:07:20Z", "Dialpad - Called from": null },
-  { Id: 776418, Subject: "Workflow task question", Tags: "golden_valley,intake,qa_rn", Status: "open", Description: "I am attempting to schedule a FTF visit for Martinez, Doxie and nothing is coming up. Can you please let me know if there are tasks outstanding with either Intake?", CreatedAt: "2026-03-10T16:56:14Z", "Dialpad - Called from": null },
-  { Id: 776283, Subject: "RHI Referral- Ronald Prince- Aspirus Rhinelander hospital", Tags: "rhinelander_wi,referral_intake,new_referral_being_worked_on", Status: "open", Description: "New referral fax received from Aspirus Rhinelander hospital. Ronald Prince.", CreatedAt: "2026-03-10T15:52:53Z", "Dialpad - Called from": null },
-  { Id: 776275, Subject: "MKM: J. Koller Infection Report", Tags: "mankato,infection_report_clarification,qa_bump_start", Status: "pending", Description: "Infection report filed. J. Koller needs clarification on infection report.", CreatedAt: "2026-03-10T15:47:02Z", "Dialpad - Called from": null },
-  { Id: 776255, Subject: "Today's Visit", Tags: "miami_fl_leon,scheduling,no_response_start", Status: "open", Description: "Visit scheduling issue. No response from clinician.", CreatedAt: "2026-03-10T15:40:22Z", "Dialpad - Called from": null },
+// ============================================================
+// ZENDESK API
+// ============================================================
+const FRUSTRATION_KEYWORDS = [
+  'still waiting', 'no response', 'urgent', 'unacceptable',
+  'called 3 times', 'no one answered', 'frustrated', 'pain',
+  'emergency', 'fell', 'fall', 'medication', 'not received',
+  'never came', 'no show', 'angry', 'complaint'
 ];
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LIVE FETCH  (Anthropic API + CData MCP)
-// ─────────────────────────────────────────────────────────────────────────────
-async function fetchLiveTickets() {
-  const sql = `
-    SELECT [Id],[Subject],[Tags],[Status],[Description],[Message Details],
-           [On Call - Action's Taken],[Dialpad Ai Recap],[Dialpad Ai Call Purpose],
-           [Dialpad - Called from],[Dialpad Ai Action Items],[Was Patient Injured?],[CreatedAt]
-    FROM [Zendesk1].[Zendesk].[Tickets]
-    WHERE [Status] IN ('new','open','pending','hold')
-    ORDER BY [CreatedAt] DESC
-    LIMIT 200`;
+const CLINICAL_KEYWORDS = [
+  'medication', 'pain', 'fall', 'emergency', 'not breathing',
+  'hospice nurse', 'supply', 'equipment', 'pharmacy'
+];
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: `You are a data retrieval assistant. Execute this SQL against the CData Zendesk connection and return ONLY a valid JSON array. No markdown, no explanation, no code fences. Each row as an object with keys matching column names.
-SQL: ${sql}`,
-      messages: [{ role: "user", content: "Execute the SQL and return JSON array now." }],
-      mcp_servers: [{ type: "url", url: "https://mcp.cloud.cdata.com/mcp", name: "cdata" }],
-    }),
-  });
-  const data = await res.json();
-  const text = (data.content || []).find((b) => b.type === "text")?.text || "[]";
-  const clean = text.replace(/```json|```/g, "").trim();
-  return JSON.parse(clean);
+async function fetchZendeskData() {
+  if (!process.env.ZENDESK_SUBDOMAIN || !process.env.ZENDESK_API_TOKEN) {
+    return { available: false };
+  }
+  console.log('📞 Fetching Zendesk data...');
+
+  const base = `https://${process.env.ZENDESK_SUBDOMAIN.replace(/^https?:\/\//, '').replace('.zendesk.com', '')}.zendesk.com/api/v2`;
+  const auth = Buffer.from(`${process.env.ZENDESK_EMAIL}/token:${process.env.ZENDESK_API_TOKEN}`).toString('base64');
+  const headers = { Authorization: `Basic ${auth}` };
+
+  try {
+    // Open tickets
+    const [openRes, overdueRes, recentRes] = await Promise.all([
+      axios.get(`${base}/tickets?status=open&per_page=100`, { headers }),
+      axios.get(`${base}/tickets?status=open&sort_by=created_at&sort_order=asc&per_page=50`, { headers }),
+      axios.get(`${base}/tickets?status=open&per_page=100&sort_by=updated_at&sort_order=desc`, { headers }),
+    ]);
+
+    const openTickets = openRes.data.tickets || [];
+    const now = Date.now();
+
+    // Analyze tickets
+    const overdueTickets = openTickets.filter(t => {
+      const createdAt = new Date(t.created_at).getTime();
+      const hoursOpen = (now - createdAt) / (1000 * 60 * 60);
+      return hoursOpen > 48;
+    });
+
+    const escalatedTickets = openTickets.filter(t =>
+      t.priority === 'urgent' || t.priority === 'high' || t.tags?.includes('escalated')
+    );
+
+    // Find frustrated tickets by scanning descriptions
+    const frustratedTickets = openTickets.filter(t => {
+      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
+      return FRUSTRATION_KEYWORDS.some(kw => text.includes(kw));
+    });
+
+    const clinicalTickets = openTickets.filter(t => {
+      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
+      return CLINICAL_KEYWORDS.some(kw => text.includes(kw));
+    });
+
+    // Category breakdown
+    const categoryMap = {};
+    openTickets.forEach(t => {
+      const text = ((t.subject || '') + ' ' + (t.description || '')).toLowerCase();
+      let category = 'General';
+      if (text.includes('medication') || text.includes('pain') || text.includes('pharmacy')) category = 'Medication / Pain';
+      else if (text.includes('visit') || text.includes('nurse') || text.includes('aide')) category = 'Visit Issue';
+      else if (text.includes('fall') || text.includes('emergency') || text.includes('safety')) category = 'Safety / Fall';
+      else if (text.includes('equipment') || text.includes('supply')) category = 'Equipment / Supply';
+      else if (text.includes('complaint') || text.includes('family')) category = 'Family Complaint';
+      else if (text.includes('billing') || text.includes('invoice')) category = 'Billing';
+
+      if (!categoryMap[category]) categoryMap[category] = [];
+      categoryMap[category].push(t);
+    });
+
+    const topIssues = Object.entries(categoryMap)
+      .map(([category, tickets]) => ({
+        category,
+        count: tickets.length,
+        avgHoursOpen: Math.round(
+          tickets.reduce((sum, t) => sum + (now - new Date(t.created_at).getTime()) / (1000 * 60 * 60), 0) / tickets.length
+        ),
+      }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8);
+
+    // Average response time
+    const solvedRes = await axios.get(`${base}/tickets?status=solved&per_page=50&sort_by=updated_at&sort_order=desc`, { headers });
+    const solvedTickets = solvedRes.data.tickets || [];
+    const avgResponseHours = solvedTickets.length > 0
+      ? Math.round(
+          solvedTickets.reduce((sum, t) => {
+            return sum + (new Date(t.updated_at).getTime() - new Date(t.created_at).getTime()) / (1000 * 60 * 60);
+          }, 0) / solvedTickets.length
+        )
+      : 0;
+
+    // Tickets bouncing back and forth (updated many times but still open)
+    const bouncingTickets = openTickets.filter(t => {
+      const hoursOpen = (now - new Date(t.created_at).getTime()) / (1000 * 60 * 60);
+      return hoursOpen > 72; // Open more than 3 days = bouncing
+    });
+
+    return {
+      available: true,
+      openCount: openTickets.length,
+      overdueCount: overdueTickets.length,
+      escalatedCount: escalatedTickets.length,
+      frustratedCount: frustratedTickets.length,
+      clinicalCount: clinicalTickets.length,
+      bouncingCount: bouncingTickets.length,
+      avgResponseHours,
+      topIssues,
+      detectedKeywords: FRUSTRATION_KEYWORDS.filter(kw =>
+        openTickets.some(t => ((t.subject || '') + (t.description || '')).toLowerCase().includes(kw))
+      ),
+      criticalTickets: clinicalTickets.slice(0, 5).map(t => ({
+        id: t.id,
+        subject: t.subject,
+        hoursOpen: Math.round((now - new Date(t.created_at).getTime()) / (1000 * 60 * 60)),
+        priority: t.priority,
+        status: t.status,
+      })),
+    };
+  } catch (err) {
+    console.error('❌ Zendesk fetch failed:', err.message);
+    return { available: false, error: err.message };
+  }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SEVERITY ORDER
-// ─────────────────────────────────────────────────────────────────────────────
-const SEV_ORDER = { critical: 0, high: 1, medium: 2, info: 3, low: 4 };
+// ============================================================
+// MICROSOFT 365 — Email Scanning
+// ============================================================
+let msGraphToken = null;
+let msGraphTokenExpiry = null;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN COMPONENT
-// ─────────────────────────────────────────────────────────────────────────────
-export default function ZendeskScanner() {
-  const [tickets, setTickets] = useState(DEMO_TICKETS);
-  const [loading, setLoading] = useState(false);
-  const [liveError, setLiveError] = useState(null);
-  const [view, setView] = useState("clusters"); // clusters | repeats | dialpad | feed
-  const [selectedCat, setSelectedCat] = useState(null);
-  const [searchTerm, setSearchTerm] = useState("");
-  const [lastRefresh, setLastRefresh] = useState(new Date());
-  const [hideNoise, setHideNoise] = useState(true);
+async function getMsGraphToken() {
+  if (msGraphToken && msGraphTokenExpiry && Date.now() < msGraphTokenExpiry) {
+    return msGraphToken;
+  }
+  try {
+    const res = await axios.post(
+      `https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,
+      new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: process.env.MICROSOFT_CLIENT_ID,
+        client_secret: process.env.MICROSOFT_CLIENT_SECRET,
+        scope: 'https://graph.microsoft.com/.default'
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    msGraphToken = res.data.access_token;
+    msGraphTokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+    console.log('✅ Microsoft Graph token refreshed');
+    return msGraphToken;
+  } catch (err) {
+    console.error('❌ Microsoft Graph auth failed:', err.message);
+    return null;
+  }
+}
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
-    setLiveError(null);
+const RESIGNATION_KEYWORDS = ['resign', '2-week notice', 'two week notice', 'last day', 'leaving', 'my notice', 'notice of resignation', 'effective immediately', 'final day'];
+const COMPLAINT_KEYWORDS = ['complaint', 'grievance', 'survey', 'concern', 'issue with care', 'unhappy', 'dissatisfied'];
+const STAFFING_KEYWORDS = ['short staffed', 'no coverage', "can't cover", 'need coverage', 'call out', 'no show', 'last minute'];
+
+async function fetchEmailData() {
+  const token = await getMsGraphToken();
+  if (!token) return { available: false };
+
+  console.log('📧 Scanning emails...');
+
+  const headers = { Authorization: `Bearer ${token}` };
+  const mailbox = process.env.MICROSOFT_MAILBOX;
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const searchEmails = async (keywords) => {
+    const query = keywords.map(k => `"${k}"`).join(' OR ');
     try {
-      const live = await fetchLiveTickets();
-      if (Array.isArray(live) && live.length > 5) {
-        setTickets(live);
-        setLiveError(null);
-      } else {
-        setLiveError("Live query returned no data — showing last snapshot");
+      const res = await axios.get(
+        `https://graph.microsoft.com/v1.0/users/${mailbox}/messages`,
+        {
+          headers,
+          params: {
+            '$search': `"${keywords[0]}"`,
+            '$filter': `receivedDateTime ge ${sevenDaysAgo}`,
+            '$select': 'subject,receivedDateTime,from,bodyPreview',
+            '$top': 50,
+          }
+        }
+      );
+      return res.data.value || [];
+    } catch { return []; }
+  };
+
+  const [resignationEmails, complaintEmails, staffingEmails] = await Promise.all([
+    searchEmails(RESIGNATION_KEYWORDS),
+    searchEmails(COMPLAINT_KEYWORDS),
+    searchEmails(STAFFING_KEYWORDS),
+  ]);
+
+  // Extract branch from email content
+  const extractBranch = (text) => {
+    const branches = ['MKM', 'MKT', 'MIA', 'CHI', 'IL', 'Minneapolis', 'Mankato', 'Miami', 'Chicago'];
+    for (const b of branches) {
+      if (text.toUpperCase().includes(b.toUpperCase())) return b;
+    }
+    return 'Unknown';
+  };
+
+  const resignations = resignationEmails
+    .filter(e => RESIGNATION_KEYWORDS.some(k => (e.subject || '').toLowerCase().includes(k.toLowerCase())))
+    .map(e => ({
+      subject: e.subject,
+      from: e.from?.emailAddress?.name || e.from?.emailAddress?.address,
+      receivedAt: e.receivedDateTime,
+      branch: extractBranch(e.subject + ' ' + e.bodyPreview),
+      preview: e.bodyPreview?.substring(0, 100),
+    }));
+
+  const complaints = complaintEmails
+    .filter(e => COMPLAINT_KEYWORDS.some(k => (e.subject || '').toLowerCase().includes(k.toLowerCase())))
+    .map(e => ({
+      subject: e.subject,
+      from: e.from?.emailAddress?.name,
+      receivedAt: e.receivedDateTime,
+      branch: extractBranch(e.subject + ' ' + e.bodyPreview),
+    }));
+
+  const staffingAlerts = staffingEmails
+    .filter(e => STAFFING_KEYWORDS.some(k => (e.subject || '').toLowerCase().includes(k.toLowerCase())))
+    .map(e => ({
+      subject: e.subject,
+      from: e.from?.emailAddress?.name,
+      receivedAt: e.receivedDateTime,
+      branch: extractBranch(e.subject + ' ' + e.bodyPreview),
+    }));
+
+  return {
+    available: true,
+    resignations,
+    complaints,
+    staffingAlerts,
+    resignationCount: resignations.length,
+    complaintCount: complaints.length,
+    staffingAlertCount: staffingAlerts.length,
+  };
+}
+
+// ============================================================
+// AI SYNTHESIS — Claude generates the intelligence summary
+// ============================================================
+async function generateIntelligence(tableau, zendesk, email) {
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return generateRuleBasedAlerts(tableau, zendesk, email);
+  }
+
+  try {
+    const res = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1500,
+        system: `You are the Moments Hospice operations intelligence system. Analyze real operational data and return ONLY valid JSON (no markdown) with this structure:
+{
+  "riskAlerts": [{"level":"critical|high|medium|low","title":"...","detail":"...","source":"zendesk|email|tableau","branch":"..."}],
+  "summary": "2-3 sentence executive summary of the most urgent issues right now",
+  "staffingModelStatus": "on-track|at-risk|critical",
+  "topAction": "The single most important thing to address today"
+}`,
+        messages: [{
+          role: 'user',
+          content: `Analyze this Moments Hospice operational data and generate risk alerts:
+
+TABLEAU DATA:
+- Census rows: ${tableau.census?.length || 0} branches with data
+- Admits/Discharges data: ${JSON.stringify(tableau.admitsDischarges?.slice(0, 5))}
+- Visit data: ${JSON.stringify(tableau.visits?.slice(0, 5))}
+- Visit patterns: ${JSON.stringify(tableau.visitPatterns?.slice(0, 3))}
+
+ZENDESK:
+- Open tickets: ${zendesk.openCount || 0}
+- Overdue (>48h): ${zendesk.overdueCount || 0}
+- Escalated: ${zendesk.escalatedCount || 0}
+- Clinical/safety tickets: ${zendesk.clinicalCount || 0}
+- Bouncing tickets (>72h unresolved): ${zendesk.bouncingCount || 0}
+- Top issues: ${JSON.stringify(zendesk.topIssues || [])}
+- Critical tickets: ${JSON.stringify(zendesk.criticalTickets || [])}
+- Detected keywords: ${JSON.stringify(zendesk.detectedKeywords || [])}
+
+EMAIL (last 7 days):
+- Resignations detected: ${email.resignationCount || 0}
+${(email.resignations || []).map(r => `  - ${r.from} (${r.branch}): "${r.subject}"`).join('\n')}
+- Complaints: ${email.complaintCount || 0}
+- Staffing alerts: ${email.staffingAlertCount || 0}
+
+Generate specific, actionable risk alerts. Flag visit frequency gaps (target CNA 5x/wk, RN 2x/wk, SW/Chaplain 2x/month), patient safety issues, staffing crises, and Zendesk escalations.`
+        }]
+      },
+      { headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } }
+    );
+
+    const text = res.data.content?.[0]?.text || '';
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : generateRuleBasedAlerts(tableau, zendesk, email);
+  } catch (err) {
+    console.error('❌ AI synthesis failed:', err.message);
+    return generateRuleBasedAlerts(tableau, zendesk, email);
+  }
+}
+
+function generateRuleBasedAlerts(tableau, zendesk, email) {
+  const alerts = [];
+
+  if ((email.resignationCount || 0) >= 2) {
+    const branches = [...new Set((email.resignations || []).map(r => r.branch))];
+    alerts.push({
+      level: 'critical',
+      title: `${email.resignationCount} Resignations in Last 7 Days`,
+      detail: `Branches affected: ${branches.join(', ')}. Check census levels and schedule coverage immediately.`,
+      source: 'email',
+      branch: branches[0] || 'Unknown'
+    });
+  }
+
+  if ((zendesk.escalatedCount || 0) > 0) {
+    alerts.push({
+      level: 'critical',
+      title: `${zendesk.escalatedCount} Escalated Zendesk Tickets`,
+      detail: `${zendesk.clinicalCount || 0} are clinical/safety related. Immediate follow-up required.`,
+      source: 'zendesk',
+      branch: 'ALL'
+    });
+  }
+
+  if ((zendesk.overdueCount || 0) > 10) {
+    alerts.push({
+      level: 'high',
+      title: `${zendesk.overdueCount} Tickets Overdue (>48hrs)`,
+      detail: `Average response time is ${zendesk.avgResponseHours}h. Target is under 4 hours.`,
+      source: 'zendesk',
+      branch: 'ALL'
+    });
+  }
+
+  if ((email.staffingAlertCount || 0) > 0) {
+    alerts.push({
+      level: 'high',
+      title: `${email.staffingAlertCount} Staffing Alert Emails Detected`,
+      detail: `Emails with keywords: short staffed, no coverage, can't cover. Review branch schedule.`,
+      source: 'email',
+      branch: 'Unknown'
+    });
+  }
+
+  if ((zendesk.bouncingCount || 0) > 5) {
+    alerts.push({
+      level: 'medium',
+      title: `${zendesk.bouncingCount} Tickets Open >72 Hours Without Resolution`,
+      detail: `These are bouncing back and forth with no resolution — highest customer service failure risk.`,
+      source: 'zendesk',
+      branch: 'ALL'
+    });
+  }
+
+  return {
+    riskAlerts: alerts,
+    summary: `${alerts.filter(a => a.level === 'critical').length} critical alerts active. ${zendesk.openCount || 0} open Zendesk tickets with ${zendesk.overdueCount || 0} overdue. ${email.resignationCount || 0} resignation(s) detected this week.`,
+    staffingModelStatus: (email.resignationCount || 0) >= 2 ? 'critical' : 'at-risk',
+    topAction: alerts[0]?.title || 'Review Zendesk ticket queue and respond to overdue items.'
+  };
+}
+
+// ============================================================
+// MAIN DATA FETCH ORCHESTRATOR
+// ============================================================
+async function fetchAllData() {
+  if (isFetching) {
+    console.log('⏳ Fetch already in progress, skipping...');
+    return;
+  }
+  isFetching = true;
+  console.log('\n🔄 Starting full data refresh at', new Date().toLocaleTimeString());
+  broadcast({ type: 'refreshing' });
+
+  try {
+    const [tableau, zendesk, email] = await Promise.all([
+      fetchTableauData().catch(e => ({ error: e.message })),
+      fetchZendeskData().catch(e => ({ available: false, error: e.message })),
+      fetchEmailData().catch(e => ({ available: false, error: e.message })),
+    ]);
+
+    const intelligence = await generateIntelligence(tableau, zendesk, email);
+
+    latestData = {
+      tableau,
+      zendesk,
+      email,
+      intelligence,
+      dataAvailability: {
+        tableau: !tableau.error,
+        zendesk: zendesk.available !== false,
+        email: email.available !== false,
       }
-    } catch (e) {
-      setLiveError(`Live query error: ${e.message} — showing snapshot`);
-    }
-    setLastRefresh(new Date());
-    setLoading(false);
-  }, []);
+    };
+    lastFetched = new Date().toISOString();
 
-  // ── CLUSTERS ─────────────────────────────────────────────────────────────
-  const clusters = (() => {
-    const map = {};
-    for (const rule of KEYWORD_RULES) {
-      if (hideNoise && rule.severity === "low") continue;
-      map[rule.category] = { ...rule, tickets: [], names: new Set(), branches: new Set() };
-    }
-    for (const t of tickets) {
-      const matches = classifyTicket(t);
-      for (const rule of matches) {
-        if (!map[rule.category]) continue;
-        map[rule.category].tickets.push(t);
-        const name = extractName(t.Subject);
-        if (name) map[rule.category].names.add(name);
-        const branch = getBranch(t.Tags);
-        if (branch) map[rule.category].branches.add(branch);
-      }
-    }
-    return Object.values(map)
-      .map((c) => ({ ...c, names: [...c.names], branches: [...c.branches] }))
-      .filter((c) => c.tickets.length > 0)
-      .sort((a, b) => (SEV_ORDER[a.severity] - SEV_ORDER[b.severity]) || (b.tickets.length - a.tickets.length));
-  })();
+    broadcast({ type: 'data', payload: latestData, lastFetched });
+    console.log('✅ Data refresh complete');
 
-  // ── REPEAT PATTERNS (name + subject clustering) ───────────────────────────
-  const repeats = (() => {
-    const nameMap = {};
-    const subjectMap = {};
-    for (const t of tickets) {
-      const name = extractName(t.Subject);
-      if (name) {
-        const key = name.toUpperCase().replace(/\s+/g, " ").trim();
-        if (!nameMap[key]) nameMap[key] = [];
-        nameMap[key].push(t);
-      }
-      const normSub = (t.Subject || "").replace(/re:\s*/i, "").trim().toLowerCase().slice(0, 70);
-      if (normSub.length > 10 && !/dialpad call/i.test(normSub) && !/new fax/i.test(normSub)) {
-        if (!subjectMap[normSub]) subjectMap[normSub] = [];
-        subjectMap[normSub].push(t);
-      }
+    // Check for critical alerts — send push email if configured
+    const criticalAlerts = intelligence.riskAlerts?.filter(a => a.level === 'critical') || [];
+    if (criticalAlerts.length > 0 && process.env.DIGEST_RECIPIENTS) {
+      await sendAlertEmail(criticalAlerts, email, zendesk);
     }
-    const results = [];
-    for (const [key, tix] of Object.entries(nameMap)) {
-      if (tix.length < 2) continue;
-      const branches = [...new Set(tix.map((t) => getBranch(t.Tags)).filter(Boolean))];
-      const cats = [...new Set(tix.flatMap((t) => classifyTicket(t).map((r) => r.category)))];
-      const isCritical = cats.some((c) => /fall|safety|late|unsigned|comfort/i.test(c));
-      results.push({ type: "name", key, count: tix.length, tickets: tix, branches, cats, severity: isCritical ? "critical" : "high" });
-    }
-    for (const [sub, tix] of Object.entries(subjectMap)) {
-      if (tix.length < 3) continue;
-      const alreadyInNames = results.find((r) => r.type === "name" && tix.some((t) => extractName(t.Subject)?.toUpperCase() === r.key));
-      if (alreadyInNames) continue;
-      const branches = [...new Set(tix.map((t) => getBranch(t.Tags)).filter(Boolean))];
-      const cats = [...new Set(tix.flatMap((t) => classifyTicket(t).map((r) => r.category)))];
-      results.push({ type: "subject", key: sub, count: tix.length, tickets: tix, branches, cats, severity: "high" });
-    }
-    return results.sort((a, b) => b.count - a.count);
-  })();
 
-  // ── DIALPAD REPEAT CALLERS ────────────────────────────────────────────────
-  const dialpadRepeats = (() => {
-    const phoneMap = {};
-    for (const t of tickets) {
-      const phone = t["Dialpad - Called from"];
-      if (!phone || phone.trim() === "") continue;
-      const key = phone.trim();
-      if (!phoneMap[key]) phoneMap[key] = [];
-      phoneMap[key].push(t);
-    }
-    return Object.entries(phoneMap)
-      .filter(([, tix]) => tix.length >= 2)
-      .map(([phone, tix]) => ({
-        phone,
-        count: tix.length,
-        tickets: tix,
-        subjects: tix.map((t) => t.Subject || "").filter(Boolean),
-        branches: [...new Set(tix.map((t) => getBranch(t.Tags)).filter(Boolean))],
-        recaps: tix.map((t) => t["Dialpad Ai Recap"]).filter(Boolean),
-        purposes: [...new Set(tix.map((t) => t["Dialpad Ai Call Purpose"]).filter(Boolean))],
-        actionItems: tix.map((t) => t["Dialpad Ai Action Items"]).filter(Boolean),
-      }))
-      .sort((a, b) => b.count - a.count);
-  })();
+  } catch (err) {
+    console.error('❌ Full fetch failed:', err.message);
+    broadcast({ type: 'error', message: err.message });
+  } finally {
+    isFetching = false;
+  }
+}
 
-  // ── FILTERED FEED ─────────────────────────────────────────────────────────
-  const filteredTickets = tickets.filter((t) => {
-    if (!searchTerm) return true;
-    const q = searchTerm.toLowerCase();
-    return [t.Subject, t.Tags, t.Description, t["Message Details"], t["Dialpad Ai Recap"]]
-      .filter(Boolean).some((f) => f.toLowerCase().includes(q));
-  });
+// ============================================================
+// EMAIL DIGEST / ALERTS
+// ============================================================
+async function sendAlertEmail(criticalAlerts, emailData, zendeskData) {
+  const token = await getMsGraphToken();
+  if (!token || !process.env.DIGEST_RECIPIENTS) return;
 
-  // ── COLORS ────────────────────────────────────────────────────────────────
-  const sc = { critical: "#FF3B3B", high: "#FF8C3B", medium: "#FFB830", info: "#00D4AA", low: "#2A4A5A" };
-
-  return (
-    <div style={{ minHeight: "100vh", background: "#060C18", fontFamily: "'IBM Plex Mono',monospace", color: "#C8D8E8" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Sora:wght@600;700&display=swap');
-        @keyframes spin{to{transform:rotate(360deg)}}
-        @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes slideIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
-        *{box-sizing:border-box;margin:0;padding:0}
-        ::-webkit-scrollbar{width:3px;height:3px}
-        ::-webkit-scrollbar-thumb{background:#1a3050;border-radius:2px}
-        .card{background:rgba(8,14,28,.9);border:1px solid rgba(255,255,255,.06);border-radius:9px;transition:border-color .2s}
-        .card:hover{border-color:rgba(0,200,160,.18)}
-        .tabBtn{background:none;border:none;cursor:pointer;padding:7px 14px;border-radius:6px;font-size:10px;letter-spacing:.12em;text-transform:uppercase;transition:all .2s;font-family:'IBM Plex Mono',monospace}
-        .clusterRow{cursor:pointer;border-left:3px solid transparent;transition:all .18s;padding:10px 14px;border-radius:0}
-        .clusterRow:hover{background:rgba(255,255,255,.03)!important}
-        .noiseToggle{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:5px;color:#7ABBC8;padding:5px 10px;font-size:10px;cursor:pointer;font-family:'IBM Plex Mono',monospace}
-        input{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:6px;color:#C8D8E8;padding:8px 12px;font-family:'IBM Plex Mono',monospace;font-size:11px;outline:none;width:100%}
-        input:focus{border-color:rgba(0,200,160,.4)}
-        input::placeholder{color:#2A4A5A}
-      `}</style>
-
-      {/* ── HEADER ── */}
-      <div style={{ background: "rgba(6,12,24,.97)", borderBottom: "1px solid rgba(0,200,160,.14)", padding: "10px 18px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 100 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <div style={{ width: 30, height: 30, borderRadius: 7, background: "linear-gradient(135deg,#FF6B2B,#FF3B3B)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16 }}>⌖</div>
-          <div>
-            <div style={{ fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: 12, color: "#F0E0D8", letterSpacing: ".06em" }}>ZENDESK KEYWORD SCANNER</div>
-            <div style={{ fontSize: 9, color: "#3A4A5A", letterSpacing: ".15em", textTransform: "uppercase" }}>
-              {tickets.length} tickets · {clusters.length} clusters · {repeats.length} repeats · {dialpadRepeats.length} repeat callers
-            </div>
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px;">
+      <div style="background: #0b0f1a; color: #0AADA8; padding: 20px; border-radius: 8px 8px 0 0;">
+        <h1 style="margin:0; font-size: 18px;">🚨 Moments Hospice — Critical Alert</h1>
+        <p style="margin:5px 0 0; color: #64748b; font-size: 13px;">${new Date().toLocaleString()}</p>
+      </div>
+      <div style="background: #f8fafc; padding: 20px; border: 1px solid #e2e8f0;">
+        ${criticalAlerts.map(a => `
+          <div style="background: #fef2f2; border-left: 4px solid #ef4444; padding: 12px; margin-bottom: 10px; border-radius: 0 4px 4px 0;">
+            <strong style="color: #dc2626;">${a.title}</strong>
+            <p style="color: #64748b; font-size: 13px; margin: 5px 0 0;">${a.detail}</p>
+            <span style="font-size: 11px; color: #9ca3af;">Source: ${a.source} · Branch: ${a.branch}</span>
           </div>
-        </div>
-
-        <div style={{ display: "flex", gap: 2 }}>
-          {[["clusters", "Issue Clusters"], ["repeats", "Repeat Patterns"], ["dialpad", "Repeat Callers"], ["feed", "Ticket Feed"]].map(([id, label]) => (
-            <button key={id} className="tabBtn"
-              style={{ color: view === id ? "#FF8C3B" : "#3A5A6A", background: view === id ? "rgba(255,140,59,.12)" : "none" }}
-              onClick={() => { setView(id); setSelectedCat(null); }}>{label}</button>
-          ))}
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {liveError && <span style={{ fontSize: 9, color: "#FF8C3B", maxWidth: 200 }}>{liveError}</span>}
-          {loading && <span style={{ width: 14, height: 14, border: "2px solid rgba(255,140,59,.2)", borderTop: "2px solid #FF8C3B", borderRadius: "50%", display: "inline-block", animation: "spin .8s linear infinite" }} />}
-          <span style={{ fontSize: 9, color: "#1A3A4A" }}>{lastRefresh.toLocaleTimeString()}</span>
-          <button onClick={refresh} disabled={loading} style={{ background: "rgba(255,140,59,.1)", border: "1px solid rgba(255,140,59,.3)", borderRadius: 6, color: "#FF8C3B", fontSize: 10, padding: "6px 12px", cursor: "pointer", fontFamily: "'IBM Plex Mono',monospace" }}>↻ Scan Live</button>
+        `).join('')}
+        <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #e2e8f0;">
+          <p style="font-size: 13px; color: #64748b;">
+            Open tickets: ${zendeskData.openCount || 0} · 
+            Resignations this week: ${emailData.resignationCount || 0}
+          </p>
         </div>
       </div>
-
-      {/* ── CLUSTERS VIEW ── */}
-      {view === "clusters" && (
-        <div style={{ display: "grid", gridTemplateColumns: selectedCat ? "320px 1fr" : "1fr", height: "calc(100vh - 52px)", overflow: "hidden" }}>
-
-          {/* Cluster list */}
-          <div style={{ overflowY: "auto", borderRight: "1px solid rgba(255,255,255,.05)", padding: "10px 8px" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0 6px 8px" }}>
-              <span style={{ fontSize: 9, color: "#3A5A6A", letterSpacing: ".1em", textTransform: "uppercase" }}>{clusters.length} active clusters</span>
-              <button className="noiseToggle" onClick={() => setHideNoise(!hideNoise)}>
-                {hideNoise ? "Show All" : "Hide Low-Signal"}
-              </button>
-            </div>
-            {clusters.map((c, i) => (
-              <div key={c.category} className="clusterRow"
-                style={{ marginBottom: 3, background: selectedCat?.category === c.category ? `${c.bg}CC` : "transparent", borderLeftColor: selectedCat?.category === c.category ? c.color : "transparent", animation: `slideIn .25s ease ${i * .025}s both` }}
-                onClick={() => setSelectedCat(selectedCat?.category === c.category ? null : c)}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                    <span style={{ fontSize: 13 }}>{c.icon}</span>
-                    <span style={{ fontSize: 11, color: c.color, fontWeight: 600 }}>{c.category}</span>
-                  </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span style={{ fontSize: 20, fontWeight: 700, color: c.color, fontFamily: "'Sora',sans-serif", lineHeight: 1 }}>{c.tickets.length}</span>
-                    <span style={{ padding: "1px 5px", borderRadius: 3, fontSize: 8, fontWeight: 700, background: `${c.color}20`, color: c.color, letterSpacing: ".06em" }}>{c.severity.toUpperCase()}</span>
-                  </div>
-                </div>
-                {c.branches.length > 0 && (
-                  <div style={{ fontSize: 9, color: "#3A5A6A", marginTop: 3 }}>
-                    {c.branches.slice(0, 4).join(" · ")}{c.branches.length > 4 ? ` +${c.branches.length - 4}` : ""}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-
-          {/* Cluster detail */}
-          {selectedCat && (
-            <div style={{ overflowY: "auto", padding: "14px 16px" }}>
-              <div style={{ marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 20 }}>{selectedCat.icon}</span>
-                <span style={{ fontFamily: "'Sora',sans-serif", fontWeight: 700, fontSize: 16, color: selectedCat.color }}>{selectedCat.category}</span>
-                <span style={{ fontSize: 11, color: "#4A6A7A" }}>{selectedCat.tickets.length} tickets</span>
-              </div>
-
-              {selectedCat.clinical_action && (
-                <div style={{ padding: "8px 12px", borderRadius: 7, marginBottom: 10, background: `${selectedCat.color}10`, border: `1px solid ${selectedCat.color}28` }}>
-                  <div style={{ fontSize: 9, color: selectedCat.color, letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 4 }}>Required Action</div>
-                  <div style={{ fontSize: 11, color: "#D0E0EC" }}>{selectedCat.clinical_action}</div>
-                </div>
-              )}
-
-              {selectedCat.names.length > 0 && (
-                <div style={{ padding: "8px 12px", borderRadius: 7, marginBottom: 10, background: "rgba(255,255,255,.02)", border: "1px solid rgba(255,255,255,.05)" }}>
-                  <div style={{ fontSize: 9, color: "#4A6A7A", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 6 }}>Patients / Names Identified</div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-                    {selectedCat.names.map((n, i) => (
-                      <span key={i} style={{ padding: "2px 9px", borderRadius: 20, fontSize: 11, background: `${selectedCat.color}18`, color: selectedCat.color, border: `1px solid ${selectedCat.color}28` }}>{n}</span>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {selectedCat.tickets.map((t, i) => {
-                  const branch = getBranch(t.Tags);
-                  const name = extractName(t.Subject);
-                  const bodySnippet = (t.Description || t["Message Details"] || "").slice(0, 180).replace(/!\[.*?\]\(.*?\)/g, "").replace(/\n+/g, " ").trim();
-                  const dialpadRecap = t["Dialpad Ai Recap"] && !/not generated/i.test(t["Dialpad Ai Recap"]) ? t["Dialpad Ai Recap"].slice(0, 200) : null;
-                  return (
-                    <div key={t.Id} className="card" style={{ padding: "10px 13px", borderLeft: `3px solid ${selectedCat.color}55`, animation: `fadeUp .2s ease ${i * .04}s both` }}>
-                      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 }}>
-                        <div style={{ flex: 1 }}>
-                          {name && <div style={{ fontSize: 10, color: selectedCat.color, fontWeight: 600, marginBottom: 2 }}>👤 {name}</div>}
-                          <div style={{ fontSize: 12, color: "#D0E0EC", lineHeight: 1.4, marginBottom: bodySnippet ? 5 : 0 }}>{t.Subject}</div>
-                          {bodySnippet && <div style={{ fontSize: 10, color: "#5A7A8A", lineHeight: 1.5 }}>{bodySnippet}{bodySnippet.length >= 180 ? "…" : ""}</div>}
-                          {dialpadRecap && (
-                            <div style={{ marginTop: 6, padding: "5px 8px", borderRadius: 5, background: "rgba(0,200,160,.06)", border: "1px solid rgba(0,200,160,.15)", fontSize: 10, color: "#6AAAA0" }}>
-                              🤖 AI Recap: {dialpadRecap}
-                            </div>
-                          )}
-                          {t["Dialpad Ai Action Items"] && (
-                            <div style={{ marginTop: 4, fontSize: 10, color: "#FFB830" }}>⚡ {t["Dialpad Ai Action Items"]}</div>
-                          )}
-                        </div>
-                        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, flexShrink: 0 }}>
-                          {branch && <span style={{ padding: "2px 7px", borderRadius: 4, fontSize: 9, background: "rgba(0,200,160,.09)", color: "#00C8A0", border: "1px solid rgba(0,200,160,.2)" }}>{branch}</span>}
-                          <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 9, background: t.Status === "pending" ? "rgba(255,140,59,.12)" : t.Status === "new" ? "rgba(255,59,59,.12)" : t.Status === "hold" ? "rgba(200,180,0,.1)" : "rgba(59,170,255,.08)", color: t.Status === "pending" ? "#FF8C3B" : t.Status === "new" ? "#FF3B3B" : t.Status === "hold" ? "#C8B400" : "#3BAAFF" }}>{t.Status}</span>
-                          <span style={{ fontSize: 9, color: "#1A3A4A" }}>#{t.Id}</span>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── REPEAT PATTERNS VIEW ── */}
-      {view === "repeats" && (
-        <div style={{ padding: "14px 18px", overflowY: "auto", height: "calc(100vh - 52px)" }}>
-          <div style={{ padding: "8px 12px", borderRadius: 7, marginBottom: 12, background: "rgba(255,59,59,.05)", border: "1px solid rgba(255,59,59,.14)", fontSize: 11, color: "#FFAAAA" }}>
-            🔁 <strong>{repeats.length} repeat patterns</strong> detected — same patient name or near-identical subject appearing across multiple open tickets. These indicate escalation failures or system gaps.
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
-            {repeats.map((r, i) => (
-              <div key={r.key} className="card" style={{ padding: "12px 14px", borderLeft: `3px solid ${r.severity === "critical" ? "#FF3B3B" : "#FF8C3B"}`, animation: `fadeUp .3s ease ${i * .05}s both` }}>
-                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 8 }}>
-                  <div>
-                    <div style={{ fontSize: 9, color: "#4A6A7A", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 2 }}>
-                      {r.type === "name" ? "👤 Same Patient / Name" : "🔁 Same Issue Repeating"}
-                    </div>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: r.severity === "critical" ? "#FF8A8A" : "#FFB870", fontFamily: "'Sora',sans-serif" }}>{r.key}</div>
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 26, fontWeight: 700, color: r.severity === "critical" ? "#FF3B3B" : "#FF8C3B", fontFamily: "'Sora',sans-serif", lineHeight: 1 }}>{r.count}</div>
-                    <div style={{ fontSize: 9, color: "#4A6A7A" }}>open tickets</div>
-                  </div>
-                </div>
-                {r.branches.length > 0 && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 7 }}>
-                    {r.branches.map((b, j) => (
-                      <span key={j} style={{ padding: "2px 7px", borderRadius: 4, fontSize: 9, background: "rgba(0,200,160,.09)", color: "#00C8A0", border: "1px solid rgba(0,200,160,.18)" }}>{b}</span>
-                    ))}
-                  </div>
-                )}
-                {r.cats.length > 0 && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
-                    {r.cats.slice(0, 3).map((c, j) => {
-                      const rule = KEYWORD_RULES.find((kr) => kr.category === c);
-                      return <span key={j} style={{ padding: "1px 6px", borderRadius: 4, fontSize: 9, background: rule ? `${rule.color}18` : "rgba(255,255,255,.05)", color: rule ? rule.color : "#7ABBC8", border: `1px solid ${rule ? rule.color + "30" : "rgba(255,255,255,.07)"}` }}>{c}</span>;
-                    })}
-                  </div>
-                )}
-                <div style={{ borderTop: "1px solid rgba(255,255,255,.05)", paddingTop: 7 }}>
-                  {r.tickets.slice(0, 3).map((t, j) => (
-                    <div key={t.Id} style={{ fontSize: 10, color: "#5A8A9A", marginBottom: 3, display: "flex", alignItems: "center", gap: 5 }}>
-                      <span style={{ width: 4, height: 4, borderRadius: "50%", background: "#2A4A5A", flexShrink: 0 }} />
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.Subject}</span>
-                      <span style={{ fontSize: 9, color: "#2A4A5A", flexShrink: 0 }}>#{t.Id}</span>
-                    </div>
-                  ))}
-                  {r.tickets.length > 3 && <div style={{ fontSize: 9, color: "#2A4A5A", marginTop: 3 }}>+{r.tickets.length - 3} more tickets</div>}
-                </div>
-              </div>
-            ))}
-            {repeats.length === 0 && <div style={{ gridColumn: "1/-1", padding: 40, textAlign: "center", color: "#3A5A6A", fontSize: 12 }}>No repeat patterns detected in current ticket snapshot.</div>}
-          </div>
-        </div>
-      )}
-
-      {/* ── DIALPAD REPEAT CALLERS VIEW ── */}
-      {view === "dialpad" && (
-        <div style={{ padding: "14px 18px", overflowY: "auto", height: "calc(100vh - 52px)" }}>
-          <div style={{ padding: "8px 12px", borderRadius: 7, marginBottom: 12, background: "rgba(224,92,255,.05)", border: "1px solid rgba(224,92,255,.14)", fontSize: 11, color: "#DDAAFF" }}>
-            📱 <strong>{dialpadRepeats.length} repeat callers</strong> detected — same phone number generated multiple open tickets. These may indicate unresolved issues, failed callbacks, or patients/facilities that need priority escalation.
-          </div>
-          {dialpadRepeats.length === 0 && (
-            <div style={{ padding: 40, textAlign: "center", color: "#3A5A6A", fontSize: 12 }}>
-              No repeat callers detected. Dialpad tickets in current snapshot may not have phone data populated yet.<br />
-              <span style={{ fontSize: 10, color: "#2A4A5A" }}>Live data pull will populate this from the "Dialpad - Called from" field.</span>
-            </div>
-          )}
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {dialpadRepeats.map((r, i) => (
-              <div key={r.phone} className="card" style={{ padding: "12px 16px", borderLeft: "3px solid #E05CFF", animation: `fadeUp .3s ease ${i * .08}s both` }}>
-                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 8 }}>
-                  <div>
-                    <div style={{ fontSize: 9, color: "#9A4ABB", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 3 }}>📞 Repeat Caller</div>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: "#E05CFF", fontFamily: "'Sora',sans-serif" }}>{r.phone}</div>
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 24, fontWeight: 700, color: "#E05CFF", fontFamily: "'Sora',sans-serif", lineHeight: 1 }}>{r.count}</div>
-                    <div style={{ fontSize: 9, color: "#4A6A7A" }}>calls / tickets</div>
-                  </div>
-                </div>
-                {r.purposes.length > 0 && (
-                  <div style={{ fontSize: 10, color: "#C084FC", marginBottom: 6 }}>Call purpose: {r.purposes.join(", ")}</div>
-                )}
-                {r.branches.length > 0 && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 7 }}>
-                    {r.branches.map((b, j) => <span key={j} style={{ padding: "2px 7px", borderRadius: 4, fontSize: 9, background: "rgba(0,200,160,.09)", color: "#00C8A0", border: "1px solid rgba(0,200,160,.18)" }}>{b}</span>)}
-                  </div>
-                )}
-                {r.recaps.length > 0 && (
-                  <div style={{ padding: "7px 10px", borderRadius: 6, background: "rgba(224,92,255,.06)", border: "1px solid rgba(224,92,255,.15)", marginBottom: 8 }}>
-                    <div style={{ fontSize: 9, color: "#9A4ABB", letterSpacing: ".08em", marginBottom: 4 }}>AI RECAP</div>
-                    <div style={{ fontSize: 10, color: "#C8A8D8" }}>{r.recaps[0].slice(0, 250)}</div>
-                  </div>
-                )}
-                {r.actionItems.length > 0 && (
-                  <div style={{ fontSize: 10, color: "#FFB830", marginBottom: 7 }}>⚡ {r.actionItems[0]}</div>
-                )}
-                <div style={{ borderTop: "1px solid rgba(255,255,255,.05)", paddingTop: 7 }}>
-                  {r.tickets.map((t, j) => (
-                    <div key={t.Id} style={{ fontSize: 10, color: "#5A7A8A", marginBottom: 3, display: "flex", alignItems: "center", gap: 5 }}>
-                      <span style={{ width: 4, height: 4, borderRadius: "50%", background: "#2A4A5A", flexShrink: 0 }} />
-                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.Subject}</span>
-                      <span style={{ fontSize: 9, color: "#2A4A5A", flexShrink: 0 }}>{new Date(t.CreatedAt).toLocaleTimeString()}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ── TICKET FEED VIEW ── */}
-      {view === "feed" && (
-        <div style={{ padding: "14px 18px", overflowY: "auto", height: "calc(100vh - 52px)" }}>
-          <div style={{ marginBottom: 10 }}>
-            <input placeholder="Search subjects, body text, tags, Dialpad recaps, patient names…" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
-          </div>
-          <div style={{ fontSize: 10, color: "#2A4A5A", marginBottom: 10 }}>
-            {filteredTickets.length} tickets {searchTerm ? `matching "${searchTerm}"` : "(all open/pending/new/hold)"}
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            {filteredTickets.map((t, i) => {
-              const cats = classifyTicket(t);
-              const primaryCat = cats[0];
-              const name = extractName(t.Subject);
-              const branch = getBranch(t.Tags);
-              const bodySnippet = (t.Description || t["Message Details"] || "").slice(0, 140).replace(/!\[.*?\]\(.*?\)/g, "").replace(/\n+/g, " ").trim();
-              return (
-                <div key={t.Id} className="card" style={{ padding: "9px 13px", borderLeft: `3px solid ${primaryCat?.color || "#2A4A5A"}`, animation: i < 30 ? `fadeUp .2s ease ${Math.min(i, 15) * .02}s both` : undefined }}>
-                  <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-                    <div style={{ flex: 1 }}>
-                      {name && <span style={{ fontSize: 10, color: primaryCat?.color || "#4A6A7A", fontWeight: 600, marginRight: 8 }}>👤 {name}</span>}
-                      <span style={{ fontSize: 12, color: "#D0E0EC" }}>{t.Subject || "(no subject)"}</span>
-                      {bodySnippet && bodySnippet.length > 20 && (
-                        <div style={{ fontSize: 10, color: "#4A6A7A", marginTop: 4, lineHeight: 1.4 }}>{bodySnippet}{bodySnippet.length >= 140 ? "…" : ""}</div>
-                      )}
-                      {cats.length > 0 && (
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 5 }}>
-                          {cats.slice(0, 4).map((c, j) => (
-                            <span key={j} style={{ padding: "1px 6px", borderRadius: 4, fontSize: 9, background: `${c.color}16`, color: c.color, border: `1px solid ${c.color}28` }}>{c.icon} {c.category}</span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3, flexShrink: 0 }}>
-                      {branch && <span style={{ padding: "2px 7px", borderRadius: 4, fontSize: 9, background: "rgba(0,200,160,.08)", color: "#00C8A0", border: "1px solid rgba(0,200,160,.16)" }}>{branch}</span>}
-                      <span style={{ padding: "1px 6px", borderRadius: 4, fontSize: 9, background: t.Status === "pending" ? "rgba(255,140,59,.12)" : t.Status === "new" ? "rgba(255,59,59,.12)" : t.Status === "hold" ? "rgba(200,180,0,.1)" : "rgba(59,170,255,.08)", color: t.Status === "pending" ? "#FF8C3B" : t.Status === "new" ? "#FF3B3B" : t.Status === "hold" ? "#C8B400" : "#3BAAFF" }}>{t.Status}</span>
-                      <span style={{ fontSize: 9, color: "#1A3A4A" }}>#{t.Id}</span>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
     </div>
-  );
+  `;
+
+  try {
+    await axios.post(
+      `https://graph.microsoft.com/v1.0/users/${process.env.MICROSOFT_MAILBOX}/sendMail`,
+      {
+        message: {
+          subject: `🚨 Moments Ops Alert: ${criticalAlerts.length} Critical Issue${criticalAlerts.length > 1 ? 's' : ''} — ${new Date().toLocaleDateString()}`,
+          body: { contentType: 'HTML', content: html },
+          toRecipients: process.env.DIGEST_RECIPIENTS.split(',').map(e => ({
+            emailAddress: { address: e.trim() }
+          }))
+        }
+      },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    console.log('📧 Alert email sent');
+  } catch (err) {
+    console.error('❌ Alert email failed:', err.message);
+  }
 }
+
+async function sendDailyDigest() {
+  const token = await getMsGraphToken();
+  if (!token || !latestData || !process.env.DIGEST_RECIPIENTS) return;
+
+  const { intelligence, zendesk, email } = latestData;
+  const alerts = intelligence?.riskAlerts || [];
+  const critical = alerts.filter(a => a.level === 'critical');
+  const high = alerts.filter(a => a.level === 'high');
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 650px;">
+      <div style="background: #0b0f1a; color: white; padding: 24px; border-radius: 8px 8px 0 0;">
+        <h1 style="margin:0; font-size: 22px; color: #0AADA8;">Moments Hospice</h1>
+        <p style="margin:4px 0 0; font-size: 14px; color: #94a3b8;">Daily Operations Intelligence · ${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</p>
+      </div>
+      <div style="background: #fff8ed; border: 1px solid #fed7aa; padding: 16px; border-bottom: none;">
+        <strong style="font-size: 14px; color: #c2410c;">📋 SUMMARY</strong>
+        <p style="font-size: 13px; color: #78350f; margin: 6px 0 0;">${intelligence?.summary || 'No summary available.'}</p>
+      </div>
+      <div style="background: #f8fafc; padding: 20px; border: 1px solid #e2e8f0; border-radius: 0 0 8px 8px;">
+        <h3 style="font-size: 14px; color: #374151; margin: 0 0 12px;">⚡ TOP ACTION TODAY</h3>
+        <div style="background: #eff6ff; padding: 10px 14px; border-radius: 6px; font-size: 13px; color: #1e40af; margin-bottom: 20px;">
+          ${intelligence?.topAction || 'Review Zendesk queue'}
+        </div>
+        ${critical.length > 0 ? `
+          <h3 style="font-size: 14px; color: #dc2626; margin: 0 0 10px;">🚨 CRITICAL (${critical.length})</h3>
+          ${critical.map(a => `
+            <div style="background: #fef2f2; border-left: 3px solid #ef4444; padding: 10px 12px; margin-bottom: 8px; border-radius: 0 4px 4px 0;">
+              <strong style="font-size: 13px; color: #dc2626;">${a.title}</strong>
+              <p style="font-size: 12px; color: #6b7280; margin: 4px 0 0;">${a.detail}</p>
+            </div>
+          `).join('')}
+        ` : ''}
+        ${high.length > 0 ? `
+          <h3 style="font-size: 14px; color: #d97706; margin: 16px 0 10px;">⚠️ HIGH RISK (${high.length})</h3>
+          ${high.map(a => `
+            <div style="background: #fffbeb; border-left: 3px solid #f59e0b; padding: 10px 12px; margin-bottom: 8px; border-radius: 0 4px 4px 0;">
+              <strong style="font-size: 13px; color: #d97706;">${a.title}</strong>
+              <p style="font-size: 12px; color: #6b7280; margin: 4px 0 0;">${a.detail}</p>
+            </div>
+          `).join('')}
+        ` : ''}
+        <div style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #e5e7eb; display: flex; gap: 20px;">
+          <div style="text-align: center;">
+            <div style="font-size: 24px; font-weight: 800; color: #0AADA8;">${zendesk.openCount || 0}</div>
+            <div style="font-size: 11px; color: #9ca3af;">Open Tickets</div>
+          </div>
+          <div style="text-align: center;">
+            <div style="font-size: 24px; font-weight: 800; color: #ef4444;">${zendesk.overdueCount || 0}</div>
+            <div style="font-size: 11px; color: #9ca3af;">Overdue</div>
+          </div>
+          <div style="text-align: center;">
+            <div style="font-size: 24px; font-weight: 800; color: #f59e0b;">${email.resignationCount || 0}</div>
+            <div style="font-size: 11px; color: #9ca3af;">Resignations (7d)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  try {
+    await axios.post(
+      `https://graph.microsoft.com/v1.0/users/${process.env.MICROSOFT_MAILBOX}/sendMail`,
+      {
+        message: {
+          subject: `📊 Moments Ops Digest · ${new Date().toLocaleDateString()} · ${critical.length} Critical, ${high.length} High`,
+          body: { contentType: 'HTML', content: html },
+          toRecipients: process.env.DIGEST_RECIPIENTS.split(',').map(e => ({
+            emailAddress: { address: e.trim() }
+          }))
+        }
+      },
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    console.log('📧 Daily digest sent');
+  } catch (err) {
+    console.error('❌ Daily digest failed:', err.message);
+  }
+}
+
+// ============================================================
+// SCHEDULING
+// ============================================================
+const refreshMinutes = parseInt(process.env.REFRESH_INTERVAL_MINUTES || '30');
+// Run every N minutes
+cron.schedule(`*/${refreshMinutes} * * * *`, fetchAllData);
+
+// Daily digest
+if (process.env.SEND_EMAIL_DIGEST === 'true' && process.env.DIGEST_TIME) {
+  const [hour, minute] = (process.env.DIGEST_TIME || '06:30').split(':');
+  cron.schedule(`${minute} ${hour} * * *`, sendDailyDigest);
+  console.log(`📅 Daily digest scheduled for ${process.env.DIGEST_TIME}`);
+}
+
+// ============================================================
+// API ROUTES
+// ============================================================
+app.get('/api/data', (req, res) => {
+  res.json({ data: latestData, lastFetched });
+});
+
+app.post('/api/refresh', async (req, res) => {
+  res.json({ message: 'Refresh started' });
+  fetchAllData();
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    lastFetched,
+    dataAvailable: !!latestData,
+    refreshIntervalMinutes: refreshMinutes,
+    connections: wss.clients.size,
+  });
+});
+
+// ============================================================
+// START
+// ============================================================
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`
+╔══════════════════════════════════════════════╗
+║   Moments Hospice Operations Command Center  ║
+║   Running on port ${PORT}                       ║
+╚══════════════════════════════════════════════╝
+  `);
+  // Fetch data immediately on startup
+  setTimeout(fetchAllData, 2000);
+});

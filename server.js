@@ -82,7 +82,7 @@ async function getTableauViewData(viewId) {
   if (!token || !tableauSiteLuid) return null;
   try {
     const res = await axios.get(
-      `${process.env.TABLEAU_SERVER}/api/3.21/sites/${tableauSiteLuid}/views/${viewId}/data`,
+      `${process.env.TABLEAU_SERVER}/api/3.21/sites/${tableauSiteLuid}/views/${viewId}/csv`,
       {
         headers: { 'X-Tableau-Auth': token },
         params: { maxAge: 5 } // allow up to 5 min cached extract

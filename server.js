@@ -118,7 +118,8 @@ const TABLEAU_VIEWS = {
   keyMetricsVisits:     '0e52fd10-10eb-44ee-964a-8fde3a4d7c5d',
   keyMetricsGrossMargin:'ea12fe7f-f607-4fca-a273-2e478b07119f',
   keyMetricsCostPerDay: '4323de7a-ab69-4fa8-b02a-3af0316e0b2c',
-  visitPatterns:        'dd68946e-e038-43b3-b947-d7b328deae74',
+  visitPatterns:        '7fa1a9e7-04e5-4926-acf1-36852cd91db7', // Visits - Counts (Scheduling)
+  visitsMissed:         'a6260fca-9f9c-411f-a727-90f91ab115d9', // Visits - Missed
   hospiceCensus:        '0d1e5ad7-b894-45c0-94dc-a15a2ed5c1c7',
   workerTurnover:       '90b95c03-aed5-48ad-9f7d-79715fe6eb1c',
   fieldMetrics:         'a3b94d0b-167a-4901-9c8c-a04bd13917de',
@@ -127,11 +128,12 @@ const TABLEAU_VIEWS = {
 
 async function fetchTableauData() {
   console.log('📊 Fetching Tableau data...');
-  const [census, admitsDC, visits, visitPatterns, workerTurnover] = await Promise.all([
+  const [census, admitsDC, visits, visitPatterns, visitsMissed, workerTurnover] = await Promise.all([
     getTableauViewData(TABLEAU_VIEWS.keyMetricsCensus),
     getTableauViewData(TABLEAU_VIEWS.keyMetricsAdmitsDC),
     getTableauViewData(TABLEAU_VIEWS.keyMetricsVisits),
     getTableauViewData(TABLEAU_VIEWS.visitPatterns),
+    getTableauViewData(TABLEAU_VIEWS.visitsMissed),
     getTableauViewData(TABLEAU_VIEWS.workerTurnover),
   ]);
 
@@ -140,6 +142,7 @@ async function fetchTableauData() {
     admitsDischarges: admitsDC || [],
     visits: visits || [],
     visitPatterns: visitPatterns || [],
+    visitsMissed: visitsMissed || [],
     workerTurnover: workerTurnover || [],
   };
 }
@@ -403,7 +406,7 @@ async function generateIntelligence(tableau, zendesk, email) {
     const res = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 1500,
         system: `You are the Moments Hospice operations intelligence system. Analyze real operational data and return ONLY valid JSON (no markdown) with this structure:
 {

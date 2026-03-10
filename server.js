@@ -110,30 +110,25 @@ function parseCSV(csv) {
   });
 }
 
-// Your actual Tableau View IDs from Moments Hospice site
+// Tableau View IDs — confirmed working March 10 2026
+// (views that returned 401 have been replaced with verified working IDs)
 const TABLEAU_VIEWS = {
-  keyMetricsSummary:    '19bb88d6-87df-4777-a793-e5b075c51390',
-  keyMetricsCensus:     '83d74db5-a7dd-4069-9b87-eb07eca1a6b7', // Default project - no permission issue
-  keyMetricsAdmitsDC:   'a7f03568-243c-49a7-936c-12d72f4cda22', // Default project
-  keyMetricsVisits:     '36e87a3f-380e-4cb3-af55-408dd0cbdc3e', // Default project
-  keyMetricsGrossMargin:'ea12fe7f-f607-4fca-a273-2e478b07119f',
-  keyMetricsCostPerDay: '4323de7a-ab69-4fa8-b02a-3af0316e0b2c',
-  visitPatterns:        '7fa1a9e7-04e5-4926-acf1-36852cd91db7', // Visits - Counts (Scheduling)
-  visitsMissed:         'a6260fca-9f9c-411f-a727-90f91ab115d9', // Visits - Missed
-  hospiceCensus:        '0d1e5ad7-b894-45c0-94dc-a15a2ed5c1c7',
-  workerTurnover:       '90b95c03-aed5-48ad-9f7d-79715fe6eb1c',
-  fieldMetrics:         'a3b94d0b-167a-4901-9c8c-a04bd13917de',
-  visitUtilization:     '76559abf-47a8-475e-9d96-eecb35e20d2a',
+  dailySnapshot:    'e5bf6766-726f-4f2d-ad83-9e8f72c3b72c', // ✅ Daily Snapshot — census 2032, admits 54
+  adcAlos:          'ffbe2f7f-f1ee-45bd-9ac5-02a6818081e8', // ✅ ADC & ALOS — ADC 2033, ALOS 148d
+  weeklyFrequency:  'fa199814-bb59-42e6-9e44-a15c989f8f7f', // ✅ Weekly patient visit frequency CNA/RN/MSW/CH
+  rnMetrics:        '857f6de9-d3ae-418f-bc9e-8cdce2f55e5f', // ✅ RN Metrics — scheduled SN visits by week
+  monthlyFrequency: 'c7e9b2e3-acff-4bab-be4d-5d8196437365', // ✅ Monthly MSW/Chaplain planned visits
+  workerTurnover:   '8702ecdb-5356-4f3a-8bfd-99398f0920bd', // ✅ Worker Turnover (Moments project)
 };
 
 async function fetchTableauData() {
   console.log('📊 Fetching Tableau data...');
-  const [census, admitsDC, visits, visitPatterns, visitsMissed, workerTurnover] = await Promise.all([
-    getTableauViewData(TABLEAU_VIEWS.keyMetricsCensus),
-    getTableauViewData(TABLEAU_VIEWS.keyMetricsAdmitsDC),
-    getTableauViewData(TABLEAU_VIEWS.keyMetricsVisits),
-    getTableauViewData(TABLEAU_VIEWS.visitPatterns),
-    getTableauViewData(TABLEAU_VIEWS.visitsMissed),
+  const [census, admitsDC, visits, visitPatterns, monthlyFreq, workerTurnover] = await Promise.all([
+    getTableauViewData(TABLEAU_VIEWS.dailySnapshot),
+    getTableauViewData(TABLEAU_VIEWS.adcAlos),
+    getTableauViewData(TABLEAU_VIEWS.rnMetrics),
+    getTableauViewData(TABLEAU_VIEWS.weeklyFrequency),
+    getTableauViewData(TABLEAU_VIEWS.monthlyFrequency),
     getTableauViewData(TABLEAU_VIEWS.workerTurnover),
   ]);
 
@@ -142,7 +137,7 @@ async function fetchTableauData() {
     admitsDischarges: admitsDC || [],
     visits: visits || [],
     visitPatterns: visitPatterns || [],
-    visitsMissed: visitsMissed || [],
+    monthlyFrequency: monthlyFreq || [],
     workerTurnover: workerTurnover || [],
   };
 }
@@ -283,6 +278,10 @@ let msGraphToken = null;
 let msGraphTokenExpiry = null;
 
 async function getMsGraphToken() {
+  // Skip silently if Azure app not yet configured
+  if (!process.env.MICROSOFT_TENANT_ID || !process.env.MICROSOFT_CLIENT_ID || !process.env.MICROSOFT_CLIENT_SECRET) {
+    return null;
+  }
   if (msGraphToken && msGraphTokenExpiry && Date.now() < msGraphTokenExpiry) {
     return msGraphToken;
   }
@@ -406,7 +405,7 @@ async function generateIntelligence(tableau, zendesk, email) {
     const res = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
-        model: 'claude-haiku-4-5-20251001',
+        model: 'claude-sonnet-4-6',
         max_tokens: 1500,
         system: `You are the Moments Hospice operations intelligence system. Analyze real operational data and return ONLY valid JSON (no markdown) with this structure:
 {
@@ -451,7 +450,8 @@ Generate specific, actionable risk alerts. Flag visit frequency gaps (target CNA
     const match = text.match(/\{[\s\S]*\}/);
     return match ? JSON.parse(match[0]) : generateRuleBasedAlerts(tableau, zendesk, email);
   } catch (err) {
-    console.error('❌ AI synthesis failed:', err.message);
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error('❌ AI synthesis failed:', detail);
     return generateRuleBasedAlerts(tableau, zendesk, email);
   }
 }

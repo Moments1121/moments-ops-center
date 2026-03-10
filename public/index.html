@@ -392,23 +392,15 @@ function renderRisk(intel, zendesk) {
 //   dailySnapshot  → "Patient Count"
 //   admitsDischarges (adcAlos) → "Month of Date", "Average Daily Census", "Branch Group"
 function renderCensus(tableau) {
-  // Current census from daily snapshot
-  const snapRows   = tableau.census || [];
-  const adcRows    = tableau.admitsDischarges || [];
+  const adcRows       = tableau.admitsDischarges || [];
+  const currentCensus = tableau.currentCensus || 0;
+  const latestADC     = tableau.latestADC || (adcRows.length ? n(adcRows[adcRows.length-1]['Average Daily Census']) : null);
+  const prevADC       = adcRows.length > 1 ? n(adcRows[adcRows.length-2]['Average Daily Census']) : null;
+  const firstADC      = adcRows.length ? n(adcRows[0]['Average Daily Census']) : null;
+  const adcDelta      = latestADC && prevADC ? latestADC - prevADC : null;
+  const adcGrowth     = latestADC && firstADC ? ((latestADC-firstADC)/firstADC*100).toFixed(1) : null;
 
-  const currentCensus = snapRows.reduce((s,r)=>{
-    const v = n(r['Patient Count']||r[Object.keys(r)[0]]);
-    return s+(v||0);
-  },0);
-
-  // Latest ADC from trend data
-  const latestADC = adcRows.length ? n(adcRows[adcRows.length-1]['Average Daily Census']) : null;
-  const prevADC   = adcRows.length > 1 ? n(adcRows[adcRows.length-2]['Average Daily Census']) : null;
-  const firstADC  = adcRows.length ? n(adcRows[0]['Average Daily Census']) : null;
-  const adcDelta  = latestADC && prevADC ? latestADC - prevADC : null;
-  const adcGrowth = latestADC && firstADC ? ((latestADC-firstADC)/firstADC*100).toFixed(1) : null;
-
-  $('cnt-census').textContent = currentCensus > 0 ? fmt(currentCensus) : adcRows.length;
+  $('cnt-census').textContent = currentCensus > 0 ? fmt(currentCensus) : (latestADC ? fmt(latestADC) : adcRows.length);
 
   $('census-stats').innerHTML = `
     <div class="stat teal">
@@ -424,15 +416,14 @@ function renderCensus(tableau) {
     <div class="stat green">
       <div class="stat-label">12-Mo Growth</div>
       <div class="stat-val" style="color:var(--green)">${adcGrowth?adcGrowth+'%':'—'}</div>
-      <div class="stat-sub">${firstADC?fmt(firstADC)+' → '+fmt(latestADC):''}</div>
+      <div class="stat-sub">${firstADC&&latestADC?fmt(firstADC)+' → '+fmt(latestADC):''}</div>
     </div>
     <div class="stat blue">
-      <div class="stat-label">Data Points</div>
+      <div class="stat-label">Months of Data</div>
       <div class="stat-val" style="color:var(--blue)">${adcRows.length}</div>
-      <div class="stat-sub">Monthly ADC records</div>
+      <div class="stat-sub">ADC trend records</div>
     </div>`;
 
-  // ADC Trend
   $('adc-trend').innerHTML = adcRows.length ? adcRows.map((r,i)=>{
     const adc = n(r['Average Daily Census']);
     const mo  = (r['Month of Date']||r['Month Tooltip']||'').replace(' 20',"'");
@@ -441,54 +432,71 @@ function renderCensus(tableau) {
       <div class="trend-month">${mo}</div>
       <div class="trend-adc">${adc?fmt(adc):'—'}</div>
     </div>`;
-  }).join('') : '<div class="empty">ADC trend data loading…</div>';
+  }).join('') : '<div class="empty">ADC trend loading…</div>';
 }
 
 // ─── VISITS ──────────────────────────────────────────────────────────────────
-// Weekly Frequency 2.0 → visitPatterns rows
-// Column structure varies — try keyword matching on row values
+// Server sends tableau.disciplines = { cna, rn, sw, chaplain }
+// Each: { avg, count, patients, targetWeekly, targetMonthly, label, completionRate? }
 function renderVisits(tableau) {
-  const rows = (tableau.visitPatterns||[]).concat(tableau.visits||[]);
+  const D = tableau.disciplines || {};
 
   const discs = [
-    {key:'cna',      label:'CNA — Aide Visits',    target:5,   col:'fc-cna', color:'var(--teal)',   kw:['cna','aide','hha','home health'],   note:'CNA are hourly — gap = overstaffing vs billable visits'},
-    {key:'rn',       label:'RN — Nursing Visits',  target:2,   col:'fc-rn',  color:'var(--blue)',   kw:['rn','sn','skilled','nursing','nurse'],note:'RN 1:14 ratio assumes 2×/wk. Gap = productivity failure'},
-    {key:'sw',       label:'Social Worker',         target:0.5, col:'fc-sw',  color:'var(--purple)', kw:['social','sw','msw','lcsw'],          note:'SW caseload ~60 pts, 2×/month min. Gap = compliance risk'},
-    {key:'chaplain', label:'Chaplain',              target:0.5, col:'fc-ch',  color:'var(--orange)', kw:['chaplain','spiritual','chap'],        note:'Chaplain 2×/month minimum. Gap = compliance risk'},
+    {
+      key: 'cna', id: 'fc-cna', color: 'var(--teal)',
+      label: 'CNA — Aide Visits', d: D.cna,
+      targetLabel: '5×/wk (≈20/mo)',
+      pctFn: d => d.avg != null ? Math.min(100, Math.round((d.avg / 20) * 100)) : null,
+      actualLabel: d => d.avg != null ? d.avg.toFixed(1) + '×/mo planned' : '—',
+      note: 'CNA are hourly — gap between actual and target = overstaffing cost vs billable visits',
+    },
+    {
+      key: 'rn', id: 'fc-rn', color: 'var(--blue)',
+      label: 'RN — Nursing Visits', d: D.rn,
+      targetLabel: '2×/wk · ≥90% completion',
+      pctFn: d => d.completionRate != null ? Math.round(d.completionRate * 100) : null,
+      actualLabel: d => d.completionRate != null ? (d.completionRate * 100).toFixed(1) + '% completed' : '—',
+      note: 'RN are salaried at 1:14 ratio assuming 2×/wk. Low completion = productivity failure',
+    },
+    {
+      key: 'sw', id: 'fc-sw', color: 'var(--purple)',
+      label: 'Social Work (MSW)', d: D.sw,
+      targetLabel: '2×/month minimum',
+      pctFn: d => d.avg != null ? Math.min(100, Math.round((d.avg / 2) * 100)) : null,
+      actualLabel: d => d.avg != null ? d.avg.toFixed(1) + '×/mo planned' : '—',
+      note: 'SW caseload ~60 pts assumes 2×/month minimum. Gap = compliance risk',
+    },
+    {
+      key: 'ch', id: 'fc-ch', color: 'var(--orange)',
+      label: 'Chaplain', d: D.chaplain,
+      targetLabel: '2×/month minimum',
+      pctFn: d => d.avg != null ? Math.min(100, Math.round((d.avg / 2) * 100)) : null,
+      actualLabel: d => d.avg != null ? d.avg.toFixed(1) + '×/mo planned' : '—',
+      note: 'Chaplain 2×/month minimum. Gap = compliance risk',
+    },
   ];
 
-  discs.forEach(d=>{
-    const matching = rows.filter(r=>{
-      const txt = JSON.stringify(r).toLowerCase();
-      return d.kw.some(k=>txt.includes(k));
-    });
-    const hasData = matching.length>0;
-    let actual = null;
-    if (hasData) {
-      const vals = matching.map(r=>{
-        const nums = Object.values(r).map(v=>n(v)).filter(v=>v!=null&&v>0);
-        return nums[0]||null;
-      }).filter(v=>v!=null);
-      actual = vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : null;
-    }
-    const pct  = actual!=null ? Math.min(100,Math.round((actual/d.target)*100)) : null;
-    const clr  = color(pct);
+  discs.forEach(({ id, label, color: c, d, targetLabel, pctFn, actualLabel, note }) => {
+    const pct   = d ? pctFn(d) : null;
+    const clr   = pct == null ? 'var(--muted)' : pct < 40 ? 'var(--red)' : pct < 75 ? 'var(--amber)' : 'var(--green)';
+    const actual = d ? actualLabel(d) : '—';
+    const pts   = d?.patients || d?.count || 0;
 
-    $(d.col).innerHTML = `
+    $(id).innerHTML = `
       <div class="freq-hdr">
         <div>
-          <div class="freq-title">${d.label}</div>
-          <div style="font-size:11px;color:var(--muted);margin-top:2px">Target: ${d.target}×/wk</div>
+          <div class="freq-title">${label}</div>
+          <div style="font-size:10px;color:var(--muted);margin-top:2px;font-family:'JetBrains Mono',monospace">Target: ${targetLabel}</div>
         </div>
-        <div class="freq-pct" style="color:${clr}">${pct!=null?pct+'%':'—'}</div>
+        <div class="freq-pct" style="color:${clr}">${pct != null ? pct + '%' : '—'}</div>
       </div>
-      <div class="track"><div class="bar" style="width:${pct||0}%;background:${clr}"></div></div>
+      <div class="track"><div class="bar" style="width:${pct || 0}%;background:${clr}"></div></div>
       <div class="freq-stats">
-        <div><div class="fs-label">Target</div><div class="fs-val">${d.target}×</div></div>
-        <div><div class="fs-label">Actual</div><div class="fs-val" style="color:${clr}">${actual!=null?actual.toFixed(1)+'×':'—'}</div></div>
-        <div><div class="fs-label">Records</div><div class="fs-val" style="color:var(--muted)">${matching.length}</div></div>
+        <div><div class="fs-label">Target</div><div class="fs-val">${targetLabel.split('·')[0].trim()}</div></div>
+        <div><div class="fs-label">Actual</div><div class="fs-val" style="color:${clr};font-size:14px">${actual}</div></div>
+        <div><div class="fs-label">Patients</div><div class="fs-val" style="color:var(--muted)">${pts > 0 ? pts.toLocaleString() : '—'}</div></div>
       </div>
-      <div class="freq-note">⚠ ${d.note}</div>`;
+      <div class="freq-note">⚠ ${note}</div>`;
   });
 }
 

@@ -237,6 +237,7 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
       <button class="tab" onclick="swTab('census',this)">📊 Census &amp; ADC <span class="tab-count" id="cnt-census">—</span></button>
       <button class="tab" onclick="swTab('visits',this)">🏥 Visit Frequency <span class="tab-count" id="cnt-visits">4</span></button>
       <button class="tab" onclick="swTab('zendesk',this)">📞 Zendesk <span class="tab-count" id="cnt-zendesk">0</span></button>
+      <button class="tab" onclick="swTab('branches',this)">🗺️ Branch Freq <span class="tab-count" id="cnt-branches">0</span></button>
       <button class="tab" onclick="swTab('workforce',this)">👥 Workforce <span class="tab-count" id="cnt-workforce">0</span></button>
     </div>
 
@@ -272,6 +273,16 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
       <div class="kw-chips" id="zd-keywords"></div>
       <div class="sec">Critical Open Tickets</div>
       <div id="zd-critical"></div>
+    </div>
+
+    <!-- BRANCH FREQUENCY PANEL -->
+    <div class="panel" id="panel-branches">
+      <div class="stats" id="branch-summary-stats"></div>
+      <div class="sec">Branch Visit Frequency Matrix — March 2026</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+        Targets: CNA ≥ 20/mo (5×/wk) · Social Work ≥ 2/mo · Chaplain ≥ 2/mo · Source: HCHB Monthly Frequency
+      </div>
+      <div id="branch-matrix"></div>
     </div>
 
     <!-- WORKFORCE PANEL -->
@@ -358,6 +369,7 @@ function renderAll(data, lastFetched) {
   renderVisits(tableau);
   renderZendesk(zendesk);
   renderWorkforce(email, tableau);
+  renderBranches(tableau);
 }
 
 function setPill(id, ok) {
@@ -621,6 +633,64 @@ function renderWorkforce(email, tableau) {
         <div style="font-size:13px;font-weight:700;color:var(--blue)">${s.subject}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:3px">From: ${s.from||'Unknown'} · ${new Date(s.receivedAt).toLocaleDateString()}</div>
       </div>`).join('') || '<div class="empty">No staffing alerts ✓</div>';
+}
+
+// ─── BRANCHES ─────────────────────────────────────────────────────────────────
+function renderBranches(tableau) {
+  const rows = tableau.branchFrequency || [];
+  const critical = rows.filter(r => r.priority === 'critical').length;
+  const high     = rows.filter(r => r.priority === 'high').length;
+  $('cnt-branches').textContent = critical + high;
+
+  const cnaMiss = rows.filter(r => r.cna == null || r.cna < 2).length;
+  const swMiss  = rows.filter(r => r.sw  != null && r.sw  < 1.5).length;
+  const chMiss  = rows.filter(r => r.ch  != null && r.ch  < 1.5).length;
+
+  $('branch-summary-stats').innerHTML = `
+    <div class="stat red"><div class="stat-label">Critical Branches</div><div class="stat-val" style="color:var(--red)">${critical}</div><div class="stat-sub">2+ disciplines below target</div></div>
+    <div class="stat amber"><div class="stat-label">High Risk</div><div class="stat-val" style="color:var(--amber)">${high}</div><div class="stat-sub">1 discipline below target</div></div>
+    <div class="stat red"><div class="stat-label">CNA Below 20/mo</div><div class="stat-val" style="color:var(--red)">${cnaMiss}</div><div class="stat-sub">of ${rows.length} branches</div></div>
+    <div class="stat amber"><div class="stat-label">SW Below 2/mo</div><div class="stat-val" style="color:var(--amber)">${swMiss}</div><div class="stat-sub">of ${rows.length} branches</div></div>
+    <div class="stat amber"><div class="stat-label">CH Below 2/mo</div><div class="stat-val" style="color:var(--amber)">${chMiss}</div><div class="stat-sub">of ${rows.length} branches</div></div>
+    <div class="stat teal"><div class="stat-label">Total Branches</div><div class="stat-val" style="color:var(--teal)">${rows.length}</div><div class="stat-sub">with frequency data</div></div>`;
+
+  if (!rows.length) {
+    $('branch-matrix').innerHTML = '<div class="empty">Branch data loading...</div>';
+    return;
+  }
+
+  function fmtFreq(v, target) {
+    if (v == null) return `<div style="width:90px;text-align:center;font-size:13px;color:var(--muted2);flex-shrink:0">—</div>`;
+    const ok = v >= target, warn = v >= target * 0.75;
+    const clr = ok ? 'var(--green)' : warn ? 'var(--amber)' : 'var(--red)';
+    const bg  = ok ? 'rgba(34,212,122,.08)' : warn ? 'rgba(255,176,32,.08)' : 'rgba(255,68,68,.1)';
+    const brd = ok ? 'rgba(34,212,122,.2)' : warn ? 'rgba(255,176,32,.2)' : 'rgba(255,68,68,.25)';
+    return `<div style="width:90px;font-size:13px;font-weight:800;color:${clr};text-align:center;background:${bg};border:1px solid ${brd};border-radius:5px;padding:4px 0;flex-shrink:0;font-family:'JetBrains Mono',monospace">${v.toFixed(1)}</div>`;
+  }
+
+  function priBadge(p) {
+    return p === 'critical' ? `<span class="badge critical">CRITICAL</span>` :
+           p === 'high'     ? `<span class="badge high">HIGH</span>` :
+                              `<span class="badge low">OK</span>`;
+  }
+
+  const hdr = (t, w) => `<div style="width:${w}px;font-size:9px;font-weight:800;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-family:'JetBrains Mono',monospace;flex-shrink:0;padding:6px 8px">${t}</div>`;
+
+  const header = `<div style="display:flex;gap:8px;align-items:center;padding:4px 12px;background:var(--card);border:1px solid var(--border);border-radius:8px 8px 0 0">
+    ${hdr('Code',60)}${hdr('Patients',70)}${hdr('CNA /mo',90)}${hdr('SW /mo',90)}${hdr('CH /mo',90)}${hdr('Status',90)}
+  </div>`;
+
+  const dataRows = rows.map((r, i) => `
+    <div style="display:flex;gap:8px;align-items:center;padding:7px 12px;background:${i%2===0?'var(--card2)':'var(--card)'};border:1px solid var(--border);border-top:none">
+      <div style="width:60px;font-weight:800;font-size:13px;font-family:'JetBrains Mono',monospace;flex-shrink:0">${r.code}</div>
+      <div style="width:70px;font-size:13px;color:var(--muted);text-align:center;flex-shrink:0">${r.patients}</div>
+      ${fmtFreq(r.cna, 20)}
+      ${fmtFreq(r.sw, 2)}
+      ${fmtFreq(r.ch, 2)}
+      <div style="width:90px;flex-shrink:0">${priBadge(r.priority)}</div>
+    </div>`).join('');
+
+  $('branch-matrix').innerHTML = header + dataRows;
 }
 
 // ─── INIT ────────────────────────────────────────────────────────────────────
